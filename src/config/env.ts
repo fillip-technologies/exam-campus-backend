@@ -30,6 +30,11 @@ const schema = z
     COOKIE_DOMAIN: z.string().optional(),
     /** How OTP codes are delivered. "log" prints them to the server log (development only). */
     OTP_DELIVERY: z.enum(['log']).default('log'),
+    /** Explicit opt-in to print OTP codes to the server log in production (until an SMS / email provider exists). */
+    ALLOW_OTP_LOG_IN_PRODUCTION: z
+      .enum(['true', 'false'])
+      .default('false')
+      .transform((v) => v === 'true'),
 
     // ---- files ----
     /**
@@ -55,7 +60,7 @@ const schema = z
   .superRefine((v, ctx) => {
     if (v.STORAGE_DRIVER === 'cloudinary' && !v.CLOUDINARY_URL)
       ctx.addIssue({ code: 'custom', path: ['CLOUDINARY_URL'], message: 'STORAGE_DRIVER=cloudinary needs CLOUDINARY_URL' })
-    if (v.NODE_ENV === 'production' && v.OTP_DELIVERY === 'log')
+    if (v.NODE_ENV === 'production' && v.OTP_DELIVERY === 'log' && !v.ALLOW_OTP_LOG_IN_PRODUCTION)
       ctx.addIssue({ code: 'custom', path: ['OTP_DELIVERY'], message: 'Set a real OTP delivery provider before production' })
   })
 
