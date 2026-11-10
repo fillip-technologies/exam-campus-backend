@@ -45,7 +45,8 @@ export async function buildApp({ env, db }: BuildAppOptions) {
   await app.register(helmet, { crossOriginResourcePolicy: { policy: 'cross-origin' } })
   // The frontend is hosted on its own domain, so the API allows only the listed origins (with cookies for auth).
   await app.register(cors, {
-    origin: env.CORS_ORIGINS,
+    // "*" in CORS_ORIGINS reflects any origin (testing only; credentials still work, unlike a literal *)
+    origin: env.CORS_ORIGINS.includes('*') ? true : env.CORS_ORIGINS,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
   })

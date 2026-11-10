@@ -48,7 +48,7 @@ export const authRoutes: FastifyPluginAsync<{ env: Env }> = async (app, { env })
   /** Cookie endpoints only accept browser requests from the allowed frontend origins (CSRF defence with SameSite). */
   const allowedOrigin = async (req: FastifyRequest, reply: FastifyReply) => {
     const origin = req.headers.origin
-    if (origin && !env.CORS_ORIGINS.includes(origin)) {
+    if (origin && !env.CORS_ORIGINS.includes('*') && !env.CORS_ORIGINS.includes(origin)) {
       reply.code(403).send({ statusCode: 403, error: 'Forbidden', message: 'Origin not allowed' })
     }
   }
