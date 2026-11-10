@@ -75,13 +75,13 @@ src/
     health/
   lib/links.ts           resolveLink: link triple -> href, one query per entity type
   lib/cache.ts           public response cache (in memory; Redis when there is more than one instance)
-  lib/storage.ts         file storage (local disk now, S3/R2 later)
+  lib/storage.ts         file storage: Cloudinary (production) or local disk (development)
   shared/schemas.ts      Zod schemas: link triple, "exactly one owner" rules, JSON column shapes
   shared/identity.ts     email / mobile identifier, password and name rules (same as the frontend)
   generated/prisma/      generated client (git-ignored)
 scripts/create-admin.ts  staff accounts
 test/                    vitest
-uploads/                 uploaded files (git-ignored)
+uploads/                 uploaded files with the local driver (git-ignored)
 ```
 
 ## Accounts and files
@@ -89,8 +89,11 @@ uploads/                 uploaded files (git-ignored)
 - **Everyone logs in the same way** (customers and staff): email or 10-digit mobile + password, or a one-time code.
   The role decides access: `STUDENT` < `SUPPORT` < `EDITOR` < `ADMIN` < `SUPER_ADMIN`.
 - **OTP codes** are printed in the server log for now (`OTP_DELIVERY=log`); production needs an SMS/email provider.
-- **Uploads** are stored in `UPLOAD_DIR` on this server and served at `PUBLIC_UPLOAD_URL` (`/uploads/*`).
-  Back this folder up with the database. Moving to S3/R2 later = a new driver in `src/lib/storage.ts`.
+- **Uploads** (images and PDFs) go to **Cloudinary** with `STORAGE_DRIVER=cloudinary` + `CLOUDINARY_URL`
+  (`src/lib/storage.ts`). Files land in the `CLOUDINARY_FOLDER` folder of the Cloudinary media library; images are
+  served with `f_auto,q_auto` (WebP/AVIF, compressed per browser), PDFs as raw files. Deleting a file in the admin
+  removes it from Cloudinary and purges the CDN copy. Without a Cloudinary account (local development, tests)
+  `STORAGE_DRIVER=local` keeps files in `UPLOAD_DIR`, served at `/uploads/*`.
 
 ## Rules worth knowing
 

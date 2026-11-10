@@ -32,14 +32,29 @@ const schema = z
     OTP_DELIVERY: z.enum(['log']).default('log'),
 
     // ---- files ----
-    /** Where uploads are stored. "local" = UPLOAD_DIR on this server, served at /uploads/* (S3/R2 later). */
-    STORAGE_DRIVER: z.enum(['local']).default('local'),
+    /**
+     * Where uploads are stored. "cloudinary" = Cloudinary (images + PDFs, served from its CDN);
+     * "local" = UPLOAD_DIR on this server, served at /uploads/* (development / tests without credentials).
+     */
+    STORAGE_DRIVER: z.enum(['local', 'cloudinary']).default('local'),
+    /** cloudinary://<api_key>:<api_secret>@<cloud_name> (Cloudinary console → API Keys → "API environment variable") */
+    CLOUDINARY_URL: z
+      .string()
+      .regex(/^cloudinary:\/\/[^:]+:[^@]+@[^/?#]+$/, 'CLOUDINARY_URL must look like cloudinary://<api_key>:<api_secret>@<cloud_name>')
+      .optional(),
+    /** Folder in the Cloudinary media library that this site's uploads go into (one per environment, e.g. examcampus-staging). */
+    CLOUDINARY_FOLDER: z
+      .string()
+      .regex(/^[a-z0-9][a-z0-9_-]{0,60}$/, 'Lowercase letters, numbers, - and _')
+      .default('examcampus'),
     UPLOAD_DIR: z.string().default('uploads'),
     /** Public base URL of uploaded files; default = this API's /uploads path. */
     PUBLIC_UPLOAD_URL: z.string().optional(),
     MAX_UPLOAD_MB: z.coerce.number().positive().max(100).default(10),
   })
   .superRefine((v, ctx) => {
+    if (v.STORAGE_DRIVER === 'cloudinary' && !v.CLOUDINARY_URL)
+      ctx.addIssue({ code: 'custom', path: ['CLOUDINARY_URL'], message: 'STORAGE_DRIVER=cloudinary needs CLOUDINARY_URL' })
     if (v.NODE_ENV === 'production' && v.OTP_DELIVERY === 'log')
       ctx.addIssue({ code: 'custom', path: ['OTP_DELIVERY'], message: 'Set a real OTP delivery provider before production' })
   })

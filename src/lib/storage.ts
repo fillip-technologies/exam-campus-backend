@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { createWriteStream } from 'node:fs'
 import { mkdir, rm, stat } from 'node:fs/promises'
 import path from 'node:path'
@@ -7,8 +7,10 @@ import type { Readable } from 'node:stream'
 import type { Env } from '../config/env.js'
 
 /**
- * File storage behind one small interface. Today: "local" (files on this server's disk, served by the API at
- * /uploads/*). Later an S3 / R2 driver implements the same three methods and the rest of the code does not change.
+ * File storage behind one small interface:
+ *   "cloudinary"  images and PDFs in Cloudinary, served from its CDN (production)
+ *   "local"       files on this server's disk, served by the API at /uploads/* (development, tests)
+ * `key` is our own path ("posters/2026/11/k3j2h4.jpg"); MediaAsset stores it, so delete works the same for every driver.
  */
 export interface Storage {
   put(key: string, body: Readable): Promise<{ key: string; url: string; sizeBytes: number }>
@@ -20,8 +22,89 @@ export function createStorage(env: Env): Storage {
   switch (env.STORAGE_DRIVER) {
     case 'local':
       return localStorage(path.resolve(env.UPLOAD_DIR), (env.PUBLIC_UPLOAD_URL ?? `http://localhost:${env.PORT}/uploads`).replace(/\/$/, ''))
+    case 'cloudinary':
+      return cloudinaryStorage(parseCloudinaryUrl(env.CLOUDINARY_URL!), env.CLOUDINARY_FOLDER)
   }
 }
+
+// ---------------------------------------------------------------------------
+// Cloudinary (REST upload API, signed requests; no SDK needed)
+// ---------------------------------------------------------------------------
+
+export type CloudinaryConfig = { cloudName: string; apiKey: string; apiSecret: string }
+
+/** cloudinary://<api_key>:<api_secret>@<cloud_name> */
+export function parseCloudinaryUrl(url: string): CloudinaryConfig {
+  const u = new URL(url)
+  return { apiKey: decodeURIComponent(u.username), apiSecret: decodeURIComponent(u.password), cloudName: u.hostname }
+}
+
+/** Cloudinary request signature: SHA-1 of the sorted "k=v&k=v" params followed by the API secret. */
+export function cloudinarySignature(params: Record<string, string | number>, apiSecret: string) {
+  const toSign = Object.keys(params)
+    .sort()
+    .map((k) => `${k}=${params[k]}`)
+    .join('&')
+  return createHash('sha1').update(toSign + apiSecret).digest('hex')
+}
+
+/**
+ * Where a key lives in Cloudinary. Images are "image" assets (the public id has no extension; Cloudinary converts
+ * them on delivery). PDFs are "raw" assets: Cloudinary blocks delivery of PDFs uploaded as images by default, and
+ * raw files are served byte-for-byte (the public id keeps ".pdf").
+ */
+export function cloudinaryTarget(folder: string, key: string) {
+  const ext = path.extname(key).slice(1).toLowerCase()
+  const raw = ext === 'pdf'
+  const publicId = `${folder}/${raw ? key : key.slice(0, -(ext.length + 1))}`
+  return { resourceType: raw ? ('raw' as const) : ('image' as const), publicId, ext }
+}
+
+function cloudinaryStorage(cfg: CloudinaryConfig, folder: string, fetchImpl: typeof fetch = fetch): Storage {
+  const api = (resourceType: string, action: string) => `https://api.cloudinary.com/v1_1/${cfg.cloudName}/${resourceType}/${action}`
+
+  /** Images: f_auto,q_auto = WebP/AVIF at a sensible quality for each browser, from the CDN. */
+  const urlFor = (key: string) => {
+    const t = cloudinaryTarget(folder, key)
+    return t.resourceType === 'raw'
+      ? `https://res.cloudinary.com/${cfg.cloudName}/raw/upload/${t.publicId}`
+      : `https://res.cloudinary.com/${cfg.cloudName}/image/upload/f_auto,q_auto/${t.publicId}.${t.ext}`
+  }
+
+  async function call(resourceType: string, action: string, params: Record<string, string | number>, file?: Buffer) {
+    const signed = { ...params, timestamp: Math.floor(Date.now() / 1000) }
+    const form = new FormData()
+    for (const [k, v] of Object.entries(signed)) form.append(k, String(v))
+    form.append('api_key', cfg.apiKey)
+    form.append('signature', cloudinarySignature(signed, cfg.apiSecret))
+    if (file) form.append('file', new Blob([new Uint8Array(file)]))
+    const res = await fetchImpl(api(resourceType, action), { method: 'POST', body: form })
+    const body = (await res.json().catch(() => ({}))) as { error?: { message?: string } } & Record<string, unknown>
+    if (!res.ok) throw new Error(`Cloudinary ${action} failed (${res.status}): ${body.error?.message ?? 'unknown error'}`)
+    return body
+  }
+
+  return {
+    urlFor,
+    async put(key, body) {
+      const chunks: Buffer[] = []
+      for await (const chunk of body) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+      const file = Buffer.concat(chunks)
+      const t = cloudinaryTarget(folder, key)
+      const res = await call(t.resourceType, 'upload', { public_id: t.publicId, overwrite: 'false' }, file)
+      return { key, url: urlFor(key), sizeBytes: Number(res.bytes ?? file.length) }
+    },
+    async delete(key) {
+      const t = cloudinaryTarget(folder, key)
+      // invalidate = also purge the CDN copy; "not found" is fine (already gone)
+      const res = await call(t.resourceType, 'destroy', { public_id: t.publicId, invalidate: 'true' })
+      if (res.result !== 'ok' && res.result !== 'not found') throw new Error(`Cloudinary destroy failed: ${String(res.result)}`)
+    },
+  }
+}
+
+/** For tests: a Cloudinary driver with a fake fetch. */
+export const cloudinaryStorageForTest = cloudinaryStorage
 
 function localStorage(root: string, publicBase: string): Storage {
   const resolve = (key: string) => {
