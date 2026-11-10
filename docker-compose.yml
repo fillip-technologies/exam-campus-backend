@@ -1,0 +1,28 @@
+# Local development services for the backend. Start with `npm run db:up`.
+# MySQL listens on 3307 on the host so it does not clash with a local MySQL/MariaDB on 3306.
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: examcampus-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: examcampus
+      MYSQL_USER: examcampus
+      MYSQL_PASSWORD: examcampus
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./docker/mysql-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  mysql-data:

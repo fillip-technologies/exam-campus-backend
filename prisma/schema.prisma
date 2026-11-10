@@ -1,0 +1,1457 @@
+// ExamCampus: database design (MySQL 8 + Prisma 7). Source of truth for the database.
+//
+// Conventions
+//  - Rows that appear on the public site have `sort` (admin drag-and-drop order) and `visible`/`active`/`status`.
+//  - Anything that links somewhere uses the "link triple": linkType + linkRef + linkUrl.
+//      linkType=EXAM,   linkRef=<Exam.id>    -> API resolves to /exams/<current slug> (slug renames never break links)
+//      linkType=ANCHOR, linkRef="free-tests" -> "#free-tests" on the home page
+//      linkType=URL,    linkUrl="https://..." or "/about"
+//    linkRef has no foreign key: if the target is deleted or not PUBLISHED, resolveLink() returns null and the
+//    site hides the link (or falls back, e.g. a banner scrolls to #test-series).
+//  - Icons are stored as a key string (e.g. "Landmark") from an allow-list of lucide icons the admin can pick.
+//  - Images are stored as URLs; MediaAsset is the admin's upload library (no FK, so the CDN URL is all the site needs).
+//  - Money: catalogue prices (TestSeries, Pass) are whole rupees. Orders and payments are paise (`...Paise`),
+//    because Razorpay works in paise and GST produces fractions of a rupee.
+//  - Slugs: kebab-case, unique, shown in URLs. Rename = new slug + SlugRedirect row.
+//  - Text sizes: Prisma maps String to VARCHAR(191) on MySQL. URLs and prose use @db.Text (TEXT is stored off-row,
+//    so many of them never hit MySQL's 65,535-byte row limit); medium labels use @db.VarChar(500).
+//  - "Exactly one owner" rules:
+//      * Order / Enrollment (seriesId XOR passId): MySQL CHECK constraint (raw SQL migration). Their foreign keys
+//        are onDelete: Restrict, because MySQL rejects a CHECK on a column whose FK cascades or sets null.
+//      * TestSeries, FreeTest, QuickInfoItem (examId XOR classId), Faq (scope/owner), NavLink (navItemId XOR columnId):
+//        these FKs cascade, so the rule lives in Zod (src/shared/schemas.ts) and every write goes through it.
+//      * One isPrimary series per hub: enforced in the series service inside a transaction.
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "esm"
+}
+
+// The connection URL lives in prisma.config.ts (Prisma 7).
+datasource db {
+  provider = "mysql"
+}
+
+// =====================================================================
+// ENUMS
+// =====================================================================
+
+enum Role {
+  STUDENT
+  SUPPORT // read orders/users, answer contact messages
+  EDITOR // edit content, cannot touch users/payments/settings
+  ADMIN // everything except managing other admins
+  SUPER_ADMIN
+}
+
+enum PublishStatus {
+  DRAFT
+  COMING_SOON // listed in menus, no hub page link yet
+  PUBLISHED
+  ARCHIVED
+}
+
+enum LinkType {
+  NONE
+  URL
+  EXAM
+  CLASS
+  SERIES
+  FREE_TEST
+  CATEGORY
+  PAGE
+  ANCHOR // "#free-tests" scroll targets on the home page
+}
+
+enum StatusTone {
+  INFO
+  SUCCESS
+  WARNING
+}
+
+enum NavItemType {
+  MEGA
+  DROPDOWN
+  LINK
+}
+
+enum NavContentSource {
+  MANUAL // admin builds columns/links by hand (Academic mega menu, dropdowns)
+  EXAM_CATEGORIES // auto-built from ExamCategory rows (Competitive Exams, PYQs)
+}
+
+enum CategoryMenu {
+  COMPETITIVE
+  PYQ
+}
+
+enum HomeSectionType {
+  HERO // heading + category chips + banner carousel + tabbed series browser
+  WHY_POINTS // "Why practise on ExamCampus" strip
+  EXAM_CATEGORIES // "Popular Exams" grid
+  PASS // ExamCampus Pass block
+  FREE_TESTS // free mock tests with category filter
+  EXAM_EXPERIENCE // "Practice like it's the real exam" + sample test screen
+  MOBILE_APP // app launch / waitlist block
+  FAQ
+  FINAL_CTA
+  RICH_TEXT // admin-written block
+  BANNER_STRIP // promo strip
+  CUSTOM_BLOCK // admin-defined BlockType (Phase 4 builder)
+  COLLECTION // renders entries of a Collection (Phase 4 builder)
+}
+
+enum SectionItemRole {
+  ITEM
+  CTA_PRIMARY
+  CTA_SECONDARY
+}
+
+enum TabRule {
+  CURATED // admin-picked series first (SeriesTabItem), then the rest
+  ALL
+  HAS_SECTIONAL
+  HAS_TOPIC
+  HAS_PYQ
+  HAS_FREE_TEST
+}
+
+enum FaqScope {
+  HOME
+  EXAM
+  CLASS
+}
+
+enum BannerPlacement {
+  HERO
+  STRIP
+}
+
+enum SuggestionKind {
+  SUGGESTION // chips under the search box
+  POPULAR // "popular searches"
+}
+
+enum ProductType {
+  SERIES
+  PASS
+}
+
+enum OrderStatus {
+  CREATED
+  PAID
+  FAILED
+  REFUNDED
+}
+
+enum DiscountType {
+  PERCENT
+  FLAT
+}
+
+enum ContactStatus {
+  NEW
+  IN_PROGRESS
+  RESOLVED
+}
+
+enum OtpPurpose {
+  SIGNUP
+  LOGIN
+  RESET_PASSWORD
+}
+
+enum TestKind {
+  FULL_LENGTH
+  SECTIONAL
+  TOPIC
+  PYQ
+  CHAPTER
+  UNIT
+  FREE
+}
+
+enum QuestionType {
+  MCQ_SINGLE
+  MCQ_MULTI
+  NUMERIC
+  DESCRIPTIVE
+}
+
+enum AttemptStatus {
+  IN_PROGRESS
+  SUBMITTED
+  EXPIRED
+}
+
+// =====================================================================
+// 1. SITE CHROME: settings, announcement bar, navbar, footer, search
+// =====================================================================
+
+/// Single row (id = 1, CHECK constraint). Brand, header buttons, footer text, contact, SEO defaults.
+model SiteSetting {
+  id Int @id @default(1)
+
+  siteName String  @default("ExamCampus")
+  tagline  String? // "One Campus All Exam" (under the logo)
+
+  logoMarkUrl     String? @db.Text
+  logoWordmarkUrl String? @db.Text
+  faviconUrl      String? @db.Text
+
+  // header right side
+  headerLoginLabel  String   @default("Login")
+  headerCtaLabel    String   @default("Start Learning")
+  headerCtaLinkType LinkType @default(ANCHOR)
+  headerCtaLinkRef  String?
+  headerCtaLinkUrl  String?  @db.Text
+  searchPlaceholder String?  @db.VarChar(500)
+
+  // footer
+  footerTagline    String? @db.VarChar(500) // "Test series and online practice for government and competitive exams."
+  copyrightText    String? @db.VarChar(500) // "ExamCampus. All rights reserved." (year added by the site)
+  developerName    String? // "Fillip Technologies"
+  developerUrl     String? @db.Text
+  developerLogoUrl String? @db.Text
+
+  // contact (also used on the Contact page)
+  contactEmail String?
+  contactPhone String?
+  address      String? @db.Text
+
+  // SEO defaults
+  seoTitleTemplate       String? // "%s | ExamCampus"
+  defaultMetaDescription String? @db.VarChar(500)
+  defaultOgImageUrl      String? @db.Text
+  analyticsId            String?
+
+  maintenanceMode Boolean  @default(false)
+  updatedAt       DateTime @updatedAt
+  updatedById     String?
+}
+
+/// Top strip: "Learn, Practice & Prepare for Every Important Exam - All in One Place" + "Explore Free Tests".
+/// The site shows the first active, in-schedule row by `sort`.
+model Announcement {
+  /// admin-defined extra fields, keyed by CustomFieldDef.key and validated against it
+  customFields Json?
+  id           String    @id @default(cuid())
+  text         String    @db.VarChar(500) // desktop text
+  mobileText   String? // short text for phones
+  ctaLabel     String? // "Explore Free Tests"
+  linkType     LinkType  @default(NONE)
+  linkRef      String?
+  linkUrl      String?   @db.Text
+  theme        String? // "dark" | "accent" | "light"
+  dismissible  Boolean   @default(false)
+  startsAt     DateTime?
+  endsAt       DateTime?
+  active       Boolean   @default(true)
+  sort         Int       @default(0)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+}
+
+/// Top-level navbar entries: Academic, Competitive Exams, Test Series, PYQs, Exam Details, Campus Store.
+model NavItem {
+  /// admin-defined extra fields, keyed by CustomFieldDef.key and validated against it
+  customFields Json?
+  id           String      @id @default(cuid())
+  key          String      @unique // "academic", "competitive" ...
+  label        String
+  ariaLabel    String?
+  type         NavItemType
+  badge        String? // "Class 6+"
+  iconKey      String? // Campus Store has a bag icon
+  wide         Boolean     @default(false)
+
+  // dropdown footer link ("Browse the Campus Store")
+  footerLabel    String?
+  footerLinkType LinkType @default(NONE)
+  footerLinkRef  String?
+  footerLinkUrl  String?  @db.Text
+
+  // for type=LINK
+  linkType LinkType @default(NONE)
+  linkRef  String?
+  linkUrl  String?  @db.Text
+
+  // MEGA only: where the panel content comes from
+  contentSource NavContentSource @default(MANUAL)
+  categoryMenu  CategoryMenu? // when EXAM_CATEGORIES: which ExamCategory flag to use
+
+  activePathPrefix String? // "/academic" highlights this item on those pages
+  sort             Int     @default(0)
+  visible          Boolean @default(true)
+
+  columns NavColumn[]
+  links   NavLink[] // direct links of a DROPDOWN
+
+  updatedAt DateTime @updatedAt
+}
+
+/// Column of a manual mega menu ("Class 6-8", "JEE & NEET", "Board Exam Preparation" ...).
+model NavColumn {
+  id          String  @id @default(cuid())
+  navItemId   String
+  title       String
+  description String?
+  iconKey     String?
+  sort        Int     @default(0)
+  visible     Boolean @default(true)
+
+  navItem NavItem   @relation(fields: [navItemId], references: [id], onDelete: Cascade)
+  links   NavLink[]
+
+  @@index([navItemId])
+}
+
+/// A link inside a mega column OR directly under a dropdown (exactly one of navItemId / columnId: Zod `navLinkOwner`).
+model NavLink {
+  /// admin-defined extra fields, keyed by CustomFieldDef.key and validated against it
+  customFields Json?
+  id           String   @id @default(cuid())
+  navItemId    String?
+  columnId     String?
+  label        String
+  description  String? // "Real exam interface & timing"
+  iconKey      String?
+  linkType     LinkType @default(URL)
+  linkRef      String?
+  linkUrl      String?  @db.Text
+  sort         Int      @default(0)
+  visible      Boolean  @default(true)
+
+  navItem NavItem?   @relation(fields: [navItemId], references: [id], onDelete: Cascade)
+  column  NavColumn? @relation(fields: [columnId], references: [id], onDelete: Cascade)
+
+  @@index([navItemId])
+  @@index([columnId])
+}
+
+model FooterColumn {
+  id      String  @id @default(cuid())
+  title   String // "Popular Exams", "Test Series", "Free Resources", "Company"
+  sort    Int     @default(0)
+  visible Boolean @default(true)
+
+  links FooterLink[]
+}
+
+/// Footer links. `legal = true` rows are the bottom bar (Terms, Privacy, Refund) and have no column.
+model FooterLink {
+  id       String   @id @default(cuid())
+  columnId String?
+  legal    Boolean  @default(false)
+  label    String
+  linkType LinkType @default(URL)
+  linkRef  String?
+  linkUrl  String?  @db.Text
+  sort     Int      @default(0)
+  visible  Boolean  @default(true)
+
+  column FooterColumn? @relation(fields: [columnId], references: [id], onDelete: Cascade)
+
+  @@index([columnId])
+}
+
+model SocialLink {
+  id       String  @id @default(cuid())
+  platform String // YouTube, Instagram, Facebook, Telegram ...
+  url      String  @db.Text
+  sort     Int     @default(0)
+  visible  Boolean @default(true)
+}
+
+model SearchSuggestion {
+  id    String         @id @default(cuid())
+  kind  SuggestionKind
+  label String
+  sort  Int            @default(0)
+}
+
+// =====================================================================
+// 2. TAXONOMY: organisations, exam categories, class groups, hero chips
+// =====================================================================
+
+/// Conducting body. `key` is the logo key (SBI, IBPS, SSC ...), shared by many exams.
+model ExamOrganization {
+  /// admin-defined extra fields, keyed by CustomFieldDef.key and validated against it
+  customFields Json?
+  id           String  @id @default(cuid())
+  key          String  @unique // "sbi"
+  name         String // "State Bank of India"
+  logoUrl      String? @db.Text
+
+  exams Exam[]
+}
+
+/// Teaching, SSC, Banking & Insurance, Railway, UPSC & PSC, Defence, State Govt, JEE & NEET ...
+/// The flags decide where the category shows up, so the admin never edits menus by hand for exams.
+model ExamCategory {
+  /// admin-defined extra fields, keyed by CustomFieldDef.key and validated against it
+  customFields          Json?
+  id                    String  @id @default(cuid())
+  slug                  String  @unique
+  label                 String // "Banking & Insurance"
+  shortLabel            String? // "Banking" (free-test filter chip)
+  iconKey               String?
+  sort                  Int     @default(0)
+  active                Boolean @default(true)
+  showInCompetitiveMenu Boolean @default(true)
+  showInPyqMenu         Boolean @default(true)
+  showInHomeGrid        Boolean @default(true) // "Popular Exams" cards
+  showInFreeTestFilter  Boolean @default(false)
+
+  exams     Exam[]
+  heroLinks HeroCategoryLink[]
+}
+
+/// "Classes 6-8", "Classes 9-10", "Classes 11-12" (stage labels of academic classes).
+model ClassGroup {
+  /// admin-defined extra fields, keyed by CustomFieldDef.key and validated against it
+  customFields Json?
+  id           String  @id @default(cuid())
+  slug         String  @unique
+  label        String
+  iconKey      String?
+  tagline      String? // "Strong foundations"
+  sort         Int     @default(0)
+
+  classes AcademicClass[]
+}
+
+/// Category chips next to the hero banner. Each chip filters the test series below by one or more ExamCategory.
+/// A chip with no categories shows the "no test series yet" message, same as the current frontend.
+model HeroCategory {
+  id      String  @id @default(cuid())
+  key     String  @unique // "banking", "class-6-8"
+  label   String
+  iconKey String?
+  sort    Int     @default(0)
+  visible Boolean @default(true)
+
+  categories HeroCategoryLink[]
+}
+
+model HeroCategoryLink {
+  heroCategoryId String
+  examCategoryId String
+
+  heroCategory HeroCategory @relation(fields: [heroCategoryId], references: [id], onDelete: Cascade)
+  examCategory ExamCategory @relation(fields: [examCategoryId], references: [id], onDelete: Cascade)
+
+  @@id([heroCategoryId, examCategoryId])
+  @@index([examCategoryId])
+}
+
+// =====================================================================
+// 3. EXAM HUB (/exams/:slug)
+// =====================================================================
+
+model Exam {
+  /// admin-defined extra fields, keyed by CustomFieldDef.key and validated against it
+  customFields Json?
+  id           String        @id @default(cuid())
+  slug         String        @unique
+  name         String // "SBI PO"
+  fullName     String?       @db.VarChar(500)
+  categoryId   String
+  orgId        String
+  description  String?       @db.Text
+  statusLabel  String? // "Notification released"
+  statusTone   StatusTone?
+  status       PublishStatus @default(DRAFT)
+  menuSort     Int           @default(0) // order inside its category in menus / home grid
+  aliases      Json? // string[]: search keywords ("state bank po", "sbipo")
+
+  seoTitle       String?
+  seoDescription String?   @db.VarChar(500)
+  ogImageUrl     String?   @db.Text
+  publishedAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  // eligibility / pattern / syllabus headers (the repeating parts are child tables)
+  eligibilityHighlights Json? // [{label, value}] tiles above the eligibility details
+  eligibilityDisclaimer String? @db.Text
+  patternSummary        String? @db.Text
+  patternDisclaimer     String? @db.Text
+  syllabusOfficialUrl   String? @db.Text
+
+  category ExamCategory     @relation(fields: [categoryId], references: [id])
+  org      ExamOrganization @relation(fields: [orgId], references: [id])
+
+  quickInfo           QuickInfoItem[]
+  dates               ExamDate[]
+  updates             ExamUpdate[]
+  eligibilitySections ExamEligibilitySection[]
+  patternStages       ExamPatternStage[]
+  syllabusStages      ExamSyllabusStage[]
+  papers              PreviousYearPaper[]
+  resources           ExamResource[]
+  faqs                Faq[]
+  series              TestSeries[]
+  freeTests           FreeTest[]
+  relatedTo           ExamRelation[]           @relation("RelatedFrom")
+  relatedFrom         ExamRelation[]           @relation("RelatedTo")
+
+  @@index([categoryId, menuSort])
+  @@index([orgId])
+  @@index([status])
+}
+
+/// "Related exams" cards.
+model ExamRelation {
+  examId        String
+  relatedExamId String
+  sort          Int    @default(0)
+
+  exam    Exam @relation("RelatedFrom", fields: [examId], references: [id], onDelete: Cascade)
+  related Exam @relation("RelatedTo", fields: [relatedExamId], references: [id], onDelete: Cascade)
+
+  @@id([examId, relatedExamId])
+  @@index([relatedExamId])
+}
+
+/// Key-facts bar. Shared by exams and classes (exactly one of examId / classId: Zod `hubOwner`).
+/// value NULL = "To Be Announced".
+model QuickInfoItem {
+  id      String  @id @default(cuid())
+  examId  String?
+  classId String?
+  label   String
+  value   String? @db.VarChar(500)
+  sort    Int     @default(0)
+
+  exam  Exam?          @relation(fields: [examId], references: [id], onDelete: Cascade)
+  class AcademicClass? @relation(fields: [classId], references: [id], onDelete: Cascade)
+
+  @@index([examId])
+  @@index([classId])
+}
+
+/// date NULL = "To Be Announced". The site never shows a guessed date.
+model ExamDate {
+  id        String    @id @default(cuid())
+  examId    String
+  event     String // "Application Last Date"
+  date      DateTime? @db.Date
+  highlight Boolean   @default(false)
+  sort      Int       @default(0)
+
+  exam Exam @relation(fields: [examId], references: [id], onDelete: Cascade)
+
+  @@index([examId])
+}
+
+model ExamUpdate {
+  id          String   @id @default(cuid())
+  examId      String
+  date        DateTime @db.Date
+  title       String   @db.VarChar(500)
+  description String?  @db.Text
+  sourceUrl   String?  @db.Text
+  sourceLabel String?
+
+  exam Exam @relation(fields: [examId], references: [id], onDelete: Cascade)
+
+  @@index([examId, date])
+}
+
+/// "Educational Qualification", "Age Limit" ... `blocks` = [{type:"paragraph"|"note"|"list", text?, items?}] (Zod `eligibilityBlocks`).
+model ExamEligibilitySection {
+  id     String @id @default(cuid())
+  examId String
+  title  String
+  blocks Json
+  sort   Int    @default(0)
+
+  exam Exam @relation(fields: [examId], references: [id], onDelete: Cascade)
+
+  @@index([examId])
+}
+
+model ExamPatternStage {
+  id                   String  @id @default(cuid())
+  examId               String
+  name                 String  @db.VarChar(500) // "Phase I: Preliminary Examination"
+  description          String? @db.Text
+  negativeMarking      String? @db.VarChar(500)
+  negativeMarkingShort String?
+  notes                Json? // string[]
+  sort                 Int     @default(0)
+
+  exam     Exam                 @relation(fields: [examId], references: [id], onDelete: Cascade)
+  sections ExamPatternSection[]
+
+  @@index([examId])
+}
+
+model ExamPatternSection {
+  id              String  @id @default(cuid())
+  stageId         String
+  name            String
+  questions       Int?
+  marks           Int?
+  durationMinutes Int?
+  negativeMarking String?
+  sort            Int     @default(0)
+
+  stage ExamPatternStage @relation(fields: [stageId], references: [id], onDelete: Cascade)
+
+  @@index([stageId])
+}
+
+model ExamSyllabusStage {
+  id     String @id @default(cuid())
+  examId String
+  name   String // "Preliminary Examination"
+  sort   Int    @default(0)
+
+  exam     Exam                  @relation(fields: [examId], references: [id], onDelete: Cascade)
+  subjects ExamSyllabusSubject[]
+
+  @@index([examId])
+}
+
+model ExamSyllabusSubject {
+  id      String @id @default(cuid())
+  stageId String
+  name    String
+  topics  Json? // string[]
+  sort    Int    @default(0)
+
+  stage ExamSyllabusStage @relation(fields: [stageId], references: [id], onDelete: Cascade)
+
+  @@index([stageId])
+}
+
+/// Only add a paper once the file or online test really exists.
+model PreviousYearPaper {
+  /// admin-defined extra fields, keyed by CustomFieldDef.key and validated against it
+  customFields Json?
+  id           String  @id @default(cuid())
+  examId       String
+  year         Int
+  stage        String? // "Prelims"
+  shift        String? // "Shift 1"
+  type         String? // "Memory based"
+  viewUrl      String? @db.Text
+  downloadUrl  String? @db.Text
+  testId       String? // online practice version (see Test)
+  visible      Boolean @default(true)
+
+  exam Exam  @relation(fields: [examId], references: [id], onDelete: Cascade)
+  test Test? @relation(fields: [testId], references: [id], onDelete: SetNull)
+
+  @@index([examId, year])
+  @@index([testId])
+}
+
+model ExamResource {
+  /// admin-defined extra fields, keyed by CustomFieldDef.key and validated against it
+  customFields Json?
+  id           String   @id @default(cuid())
+  examId       String
+  type         String // "Practice Tests", "Important Topics"
+  title        String   @db.VarChar(500)
+  description  String?  @db.Text
+  linkType     LinkType @default(URL)
+  linkRef      String?
+  linkUrl      String?  @db.Text
+  sort         Int      @default(0)
+
+  exam Exam @relation(fields: [examId], references: [id], onDelete: Cascade)
+
+  @@index([examId])
+}
+
+// =====================================================================
+// 4. ACADEMIC CLASS HUB (/academic/:slug)
+// =====================================================================
+
+model AcademicClass {
+  /// admin-defined extra fields, keyed by CustomFieldDef.key and validated against it
+  customFields   Json?
+  id             String        @id @default(cuid())
+  slug           String        @unique // "class-6"
+  name           String // "Class 6"
+  grade          Int
+  groupId        String
+  boards         Json? // string[]: CBSE, ICSE, State Boards
+  description    String?       @db.Text
+  status         PublishStatus @default(DRAFT)
+  seoTitle       String?
+  seoDescription String?       @db.VarChar(500)
+  ogImageUrl     String?       @db.Text
+  publishedAt    DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  group     ClassGroup       @relation(fields: [groupId], references: [id])
+  quickInfo QuickInfoItem[]
+  subjects  ClassSubject[]
+  steps     HowItWorksStep[]
+  series    TestSeries[]
+  freeTests FreeTest[]
+  faqs      Faq[]
+
+  @@index([groupId, grade])
+}
+
+model ClassSubject {
+  id        String  @id @default(cuid())
+  classId   String
+  name      String
+  summary   String? @db.Text
+  testTypes Json? // string[]
+  topics    Json? // string[]
+  sort      Int     @default(0)
+
+  class AcademicClass @relation(fields: [classId], references: [id], onDelete: Cascade)
+
+  @@index([classId])
+}
+
+model HowItWorksStep {
+  id      String @id @default(cuid())
+  classId String
+  title   String @db.VarChar(500)
+  text    String @db.Text
+  sort    Int    @default(0)
+
+  class AcademicClass @relation(fields: [classId], references: [id], onDelete: Cascade)
+
+  @@index([classId])
+}
+
+// =====================================================================
+// 5. PRODUCTS: test series, free tests, pass, hero tabs
+// =====================================================================
+
+/// One sellable package. Belongs to an exam OR a class (exactly one: Zod `hubOwner`).
+/// The isPrimary series of a hub is what /enroll/<hub-slug>, the hub sidebar and the home card use
+/// (one per hub, enforced in the series service).
+/// The Sectional / Topic-wise / PYQ tabs are computed from the counts below.
+model TestSeries {
+  /// admin-defined extra fields, keyed by CustomFieldDef.key and validated against it
+  customFields    Json?
+  id              String        @id @default(cuid())
+  slug            String        @unique // used by /enroll/:slug
+  examId          String?
+  classId         String?
+  title           String        @db.VarChar(500) // "SBI PO Complete Test Series"
+  subtitle        String?       @db.VarChar(500) // "Prelims + Mains"
+  stageTag        String? // "Tier 1 + Tier 2" chip on the card
+  languages       Json? // string[]: ["Hindi","English"]
+  validityMonths  Int           @default(12)
+  price           Int // rupees
+  mrp             Int // rupees
+  offerLabel      String? // "Limited-time offer"
+  posterUrl       String?       @db.Text
+  includes        Json? // string[]: bullet list
+  extraStats      Json? // class hubs: [{label,value}] e.g. "Chapter-wise tests: 150"
+  totalTests      Int           @default(0)
+  fullLengthTests Int           @default(0)
+  sectionalTests  Int           @default(0)
+  topicTests      Int           @default(0)
+  pyqTests        Int           @default(0)
+  isPrimary       Boolean       @default(false)
+  status          PublishStatus @default(DRAFT)
+  sort            Int           @default(0)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  // Deleting an exam/class cascades here; a series that has orders blocks that (Order.series is Restrict),
+  // so sold products are archived, never deleted.
+  exam        Exam?           @relation(fields: [examId], references: [id], onDelete: Cascade)
+  class       AcademicClass?  @relation(fields: [classId], references: [id], onDelete: Cascade)
+  tabItems    SeriesTabItem[]
+  tests       Test[]
+  orders      Order[]
+  enrollments Enrollment[]
+
+  @@index([examId, sort])
+  @@index([classId, sort])
+  @@index([status])
+}
+
+/// Tabs under the hero: Popular, Latest, Exam-wise, Sectional, Topic-wise, PYQs, Free Tests.
+/// `rule` filters automatically; CURATED tabs use SeriesTabItem rows for the admin's hand-picked order.
+model SeriesTab {
+  id      String  @id @default(cuid())
+  key     String  @unique // "popular"
+  label   String
+  iconKey String?
+  heading String // "Popular Test Series"
+  limit   Int? // max cards
+  rule    TabRule @default(ALL)
+  sort    Int     @default(0)
+  visible Boolean @default(true)
+
+  items SeriesTabItem[]
+}
+
+model SeriesTabItem {
+  tabId    String
+  seriesId String
+  sort     Int    @default(0)
+
+  tab    SeriesTab  @relation(fields: [tabId], references: [id], onDelete: Cascade)
+  series TestSeries @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+
+  @@id([tabId, seriesId])
+  @@index([seriesId])
+}
+
+/// Free mock test card / start page. Belongs to an exam OR a class (Zod `hubOwner`). Category filter = exam.category.
+model FreeTest {
+  /// admin-defined extra fields, keyed by CustomFieldDef.key and validated against it
+  customFields    Json?
+  id              String        @id @default(cuid())
+  slug            String        @unique // /free-test/:slug
+  examId          String?
+  classId         String?
+  title           String        @db.VarChar(500) // "SBI PO Prelims Free Mock Test"
+  questions       Int
+  durationMinutes Int
+  testKindLabel   String? // "Full-length mock test"
+  highlights      Json? // string[]: bullets in the featured card
+  featured        Boolean       @default(false)
+  testId          String? // the real test (Phase 3); null = start button shows "coming soon"
+  status          PublishStatus @default(DRAFT)
+  sort            Int           @default(0)
+
+  exam  Exam?          @relation(fields: [examId], references: [id], onDelete: Cascade)
+  class AcademicClass? @relation(fields: [classId], references: [id], onDelete: Cascade)
+  test  Test?          @relation(fields: [testId], references: [id], onDelete: SetNull)
+
+  @@index([examId])
+  @@index([classId])
+  @@index([testId])
+}
+
+/// ExamCampus Pass: one plan, all series. Home "Pass" section reads the active one.
+model Pass {
+  /// admin-defined extra fields, keyed by CustomFieldDef.key and validated against it
+  customFields   Json?
+  id             String  @id @default(cuid())
+  slug           String  @unique // "pass"
+  title          String
+  validityMonths Int
+  price          Int // rupees
+  mrp            Int // rupees
+  benefits       Json? // string[]
+  active         Boolean @default(true)
+
+  orders      Order[]
+  enrollments Enrollment[]
+}
+
+// =====================================================================
+// 6. HOME PAGE: sections, banners, FAQs, app waitlist
+// =====================================================================
+
+/// One block of the landing page. Order = `sort`; hide with `visible`; schedule with publishAt/unpublishAt.
+/// Fixed copy (eyebrow/title/subtitle/body) lives in columns; type-specific settings live in `config`
+/// (validated by a Zod schema per `type`, listed in the plan). Repeating rows use SectionItem.
+model HomeSection {
+  /// admin-defined extra fields, keyed by CustomFieldDef.key and validated against it
+  customFields  Json?
+  id            String          @id @default(cuid())
+  key           String          @unique // "hero", "why", "pass" ...
+  type          HomeSectionType
+  anchorId      String? // DOM id for #links, e.g. "free-tests"
+  eyebrow       String? // "ExamCampus Pass"
+  title         String?         @db.VarChar(500)
+  subtitle      String?         @db.Text
+  body          String?         @db.Text
+  config        Json?
+  blockTypeKey  String? // CUSTOM_BLOCK: which BlockType renders it
+  collectionKey String? // COLLECTION: which Collection it lists
+  sort          Int             @default(0)
+  visible       Boolean         @default(true)
+  publishAt     DateTime?
+  unpublishAt   DateTime?
+  updatedAt     DateTime        @updatedAt
+
+  items SectionItem[]
+}
+
+/// Generic repeating row: WHY points, experience benefits, app features, CTAs.
+model SectionItem {
+  /// admin-defined extra fields, keyed by CustomFieldDef.key and validated against it
+  customFields Json?
+  id           String          @id @default(cuid())
+  sectionId    String
+  role         SectionItemRole @default(ITEM)
+  iconKey      String?
+  title        String?         @db.VarChar(500)
+  text         String?         @db.Text
+  linkType     LinkType        @default(NONE)
+  linkRef      String?
+  linkUrl      String?         @db.Text
+  sort         Int             @default(0)
+  visible      Boolean         @default(true)
+
+  section HomeSection @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+
+  @@index([sectionId, role, sort])
+}
+
+/// Hero carousel posters (16:9). Link is usually an exam hub, otherwise it scrolls to #test-series.
+model Banner {
+  /// admin-defined extra fields, keyed by CustomFieldDef.key and validated against it
+  customFields   Json?
+  id             String          @id @default(cuid())
+  placement      BannerPlacement @default(HERO)
+  imageUrl       String          @db.Text
+  mobileImageUrl String?         @db.Text
+  alt            String          @db.VarChar(500)
+  linkType       LinkType        @default(NONE)
+  linkRef        String?
+  linkUrl        String?         @db.Text
+  startsAt       DateTime?
+  endsAt         DateTime?
+  active         Boolean         @default(true)
+  sort           Int             @default(0)
+  clicks         Int             @default(0)
+  createdAt      DateTime        @default(now())
+
+  @@index([placement, active, sort])
+}
+
+/// Home FAQ, exam FAQs and class FAQs (Zod `faqOwner`: HOME has no owner, EXAM/CLASS have one).
+model Faq {
+  id       String   @id @default(cuid())
+  scope    FaqScope
+  examId   String?
+  classId  String?
+  question String   @db.VarChar(500)
+  answer   String   @db.Text
+  sort     Int      @default(0)
+  active   Boolean  @default(true)
+
+  exam  Exam?          @relation(fields: [examId], references: [id], onDelete: Cascade)
+  class AcademicClass? @relation(fields: [classId], references: [id], onDelete: Cascade)
+
+  @@index([scope, sort])
+  @@index([examId])
+  @@index([classId])
+}
+
+/// "Get notified when the app is live" emails.
+model WaitlistEntry {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  source    String   @default("app")
+  createdAt DateTime @default(now())
+}
+
+// =====================================================================
+// 7. CMS PAGES & CONTACT
+// =====================================================================
+
+/// About, Contact, Terms, Privacy, Refund policy, Help ... (footer links point here with linkType=PAGE).
+model Page {
+  /// admin-defined extra fields, keyed by CustomFieldDef.key and validated against it
+  customFields   Json?
+  id             String        @id @default(cuid())
+  slug           String        @unique
+  title          String        @db.VarChar(500)
+  body           String        @db.MediumText // markdown
+  status         PublishStatus @default(DRAFT)
+  seoTitle       String?
+  seoDescription String?       @db.VarChar(500)
+  updatedAt      DateTime      @updatedAt
+}
+
+model ContactMessage {
+  id        String        @id @default(cuid())
+  name      String
+  email     String?
+  mobile    String?
+  subject   String?       @db.VarChar(500)
+  message   String        @db.Text
+  status    ContactStatus @default(NEW)
+  createdAt DateTime      @default(now())
+
+  @@index([status, createdAt])
+}
+
+// =====================================================================
+// 8. USERS, AUTH, COMMERCE (Phase 2)
+// =====================================================================
+
+/// Students and admins share this table; `role` separates them. Login = email OR mobile (like the current login modal).
+/// passwordHash is NULL for OTP-only accounts.
+model User {
+  id               String    @id @default(cuid())
+  name             String
+  email            String?   @unique
+  mobile           String?   @unique
+  passwordHash     String?
+  role             Role      @default(STUDENT)
+  isActive         Boolean   @default(true)
+  emailVerifiedAt  DateTime?
+  mobileVerifiedAt DateTime?
+  lastLoginAt      DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  sessions    Session[]
+  orders      Order[]
+  enrollments Enrollment[]
+  attempts    Attempt[]
+
+  @@index([role])
+}
+
+/// Refresh-token sessions (hash only). One row per device; revoke to log out.
+model Session {
+  id               String    @id @default(cuid())
+  userId           String
+  refreshTokenHash String    @unique
+  userAgent        String?   @db.VarChar(512)
+  ip               String?   @db.VarChar(45)
+  expiresAt        DateTime
+  revokedAt        DateTime?
+  createdAt        DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model OtpCode {
+  id         String     @id @default(cuid())
+  identifier String // email or mobile
+  purpose    OtpPurpose
+  codeHash   String
+  attempts   Int        @default(0)
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime   @default(now())
+
+  @@index([identifier, purpose])
+}
+
+/// usedCount is incremented in the same transaction that marks the order PAID (UPDATE ... WHERE usedCount < maxUses).
+model Coupon {
+  id        String       @id @default(cuid())
+  code      String       @unique
+  type      DiscountType
+  value     Int // percent, or rupees for FLAT
+  maxUses   Int?
+  usedCount Int          @default(0)
+  validFrom DateTime?
+  validTo   DateTime?
+  active    Boolean      @default(true)
+
+  orders Order[]
+}
+
+/// One purchase. Exactly one of seriesId / passId (CHECK constraint). Prices are copied here in paise,
+/// so later price edits never change history. All product FKs are Restrict: sold products are archived, not deleted.
+model Order {
+  id              String      @id @default(cuid())
+  userId          String
+  productType     ProductType
+  seriesId        String?
+  passId          String?
+  couponId        String?
+  productTitle    String      @db.VarChar(500) // copied at purchase time
+  mrpPaise        Int
+  discountPaise   Int         @default(0)
+  taxPaise        Int         @default(0) // GST included in amountPaise
+  amountPaise     Int // what the student pays (incl. GST)
+  status          OrderStatus @default(CREATED)
+  providerOrderId String?     @unique // Razorpay order id
+  failureReason   String?     @db.VarChar(500)
+
+  // invoice (GST)
+  invoiceNo    String? @unique // assigned when PAID
+  billingName  String?
+  billingEmail String?
+  billingState String? // place of supply: decides CGST+SGST vs IGST
+  gstin        String? @db.VarChar(15)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  paidAt    DateTime?
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  series      TestSeries?  @relation(fields: [seriesId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  pass        Pass?        @relation(fields: [passId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  coupon      Coupon?      @relation(fields: [couponId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  payments    Payment[]
+  enrollments Enrollment[]
+
+  @@index([userId])
+  @@index([seriesId])
+  @@index([passId])
+  @@index([couponId])
+  @@index([status, createdAt])
+}
+
+model Payment {
+  id                String   @id @default(cuid())
+  orderId           String
+  provider          String   @default("razorpay")
+  providerPaymentId String?  @unique
+  amountPaise       Int
+  status            String // captured | failed | refunded
+  raw               Json? // provider payload
+  createdAt         DateTime @default(now())
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  @@index([orderId])
+}
+
+/// Every incoming payment webhook, stored before processing. The unique event id makes retries harmless:
+/// a duplicate insert fails and the handler returns 200 without doing the work twice.
+model WebhookEvent {
+  id          String    @id @default(cuid())
+  provider    String    @default("razorpay")
+  eventId     String // provider's event id (x-razorpay-event-id header)
+  type        String // "payment.captured", "refund.processed" ...
+  payload     Json
+  processedAt DateTime?
+  error       String?   @db.Text
+  createdAt   DateTime  @default(now())
+
+  @@unique([provider, eventId])
+  @@index([processedAt])
+}
+
+/// What a student can access (created when an order is PAID, or manually by an admin).
+/// Exactly one of seriesId / passId (CHECK constraint). One enrollment per order (orderId unique).
+model Enrollment {
+  id          String      @id @default(cuid())
+  userId      String
+  productType ProductType
+  seriesId    String?
+  passId      String?
+  orderId     String?     @unique
+  startsAt    DateTime    @default(now())
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  grantedById String? // admin who granted it manually
+
+  user   User        @relation(fields: [userId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  series TestSeries? @relation(fields: [seriesId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  pass   Pass?       @relation(fields: [passId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  order  Order?      @relation(fields: [orderId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@index([userId, expiresAt])
+  @@index([seriesId])
+  @@index([passId])
+}
+
+// =====================================================================
+// 9. TEST ENGINE (Phase 3: makes "Start test" and "My Tests" real)
+// =====================================================================
+
+model Test {
+  id              String        @id @default(cuid())
+  seriesId        String?
+  title           String        @db.VarChar(500)
+  kind            TestKind
+  language        Json? // string[]: ["Hindi","English"]
+  durationMinutes Int
+  totalMarks      Int
+  instructions    String?       @db.Text
+  isFree          Boolean       @default(false)
+  status          PublishStatus @default(DRAFT)
+  sort            Int           @default(0)
+  createdAt       DateTime      @default(now())
+
+  series    TestSeries?         @relation(fields: [seriesId], references: [id], onDelete: SetNull)
+  sections  TestSection[]
+  questions TestQuestion[]
+  attempts  Attempt[]
+  papers    PreviousYearPaper[]
+  freeTests FreeTest[]
+
+  @@index([seriesId, sort])
+}
+
+model TestSection {
+  id              String @id @default(cuid())
+  testId          String
+  name            String // "Quantitative Aptitude"
+  durationMinutes Int?
+  sort            Int    @default(0)
+
+  test      Test           @relation(fields: [testId], references: [id], onDelete: Cascade)
+  questions TestQuestion[]
+
+  @@index([testId])
+}
+
+/// Reusable question bank. Text is bilingual: body = {"en": "...", "hi": "..."} (rich text / image refs allowed).
+model Question {
+  id            String       @id @default(cuid())
+  type          QuestionType @default(MCQ_SINGLE)
+  body          Json
+  explanation   Json?
+  subject       String?
+  topic         String?
+  difficulty    Int? // 1-5
+  numericAnswer Decimal?
+  createdAt     DateTime     @default(now())
+
+  options QuestionOption[]
+  inTests TestQuestion[]
+  answers AttemptAnswer[]
+
+  @@index([subject, topic])
+}
+
+model QuestionOption {
+  id         String  @id @default(cuid())
+  questionId String
+  body       Json
+  isCorrect  Boolean @default(false)
+  sort       Int     @default(0)
+
+  question Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@index([questionId])
+}
+
+model TestQuestion {
+  testId        String
+  questionId    String
+  sectionId     String?
+  marks         Decimal @default(1)
+  negativeMarks Decimal @default(0)
+  sort          Int     @default(0)
+
+  test     Test         @relation(fields: [testId], references: [id], onDelete: Cascade)
+  question Question     @relation(fields: [questionId], references: [id])
+  section  TestSection? @relation(fields: [sectionId], references: [id], onDelete: SetNull)
+
+  @@id([testId, questionId])
+  @@index([questionId])
+  @@index([sectionId])
+}
+
+model Attempt {
+  id          String        @id @default(cuid())
+  userId      String
+  testId      String
+  status      AttemptStatus @default(IN_PROGRESS)
+  startedAt   DateTime      @default(now())
+  submittedAt DateTime?
+  score       Decimal?
+  summary     Json? // accuracy, rank, section-wise scores (computed on submit)
+
+  user    User            @relation(fields: [userId], references: [id])
+  test    Test            @relation(fields: [testId], references: [id])
+  answers AttemptAnswer[]
+
+  @@index([userId, testId])
+  @@index([testId])
+}
+
+model AttemptAnswer {
+  attemptId    String
+  questionId   String
+  selected     Json? // option ids / number / text
+  markedReview Boolean @default(false)
+  timeSpentSec Int     @default(0)
+
+  attempt  Attempt  @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+  question Question @relation(fields: [questionId], references: [id])
+
+  @@id([attemptId, questionId])
+  @@index([questionId])
+}
+
+// =====================================================================
+// 10. OPERATIONS: media, audit trail, revisions, redirects
+// =====================================================================
+
+/// Admin upload library (images, posters, logos, PDFs). Files live in S3/R2; this row is the catalogue.
+model MediaAsset {
+  id           String   @id @default(cuid())
+  key          String   @unique @db.VarChar(512) // storage key
+  url          String   @db.Text
+  mime         String
+  sizeBytes    Int
+  width        Int?
+  height       Int?
+  alt          String?  @db.VarChar(500)
+  folder       String? // "posters", "exam-logos", "brand"
+  uploadedById String?
+  createdAt    DateTime @default(now())
+
+  @@index([folder])
+}
+
+/// Who changed what (every admin write).
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  action     String // "exam.update", "nav.reorder"
+  entityType String
+  entityId   String?
+  diff       Json?
+  ip         String?  @db.VarChar(45)
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([actorId, createdAt])
+}
+
+/// Snapshot before each save of big content (exam hub, home section) so the admin can undo.
+model ContentRevision {
+  id          String   @id @default(cuid())
+  entityType  String
+  entityId    String
+  snapshot    Json
+  createdById String?
+  createdAt   DateTime @default(now())
+
+  @@index([entityType, entityId, createdAt])
+}
+
+model SlugRedirect {
+  id         String   @id @default(cuid())
+  entityType String // exam | class | series | page
+  oldSlug    String
+  newSlug    String
+  createdAt  DateTime @default(now())
+
+  @@unique([entityType, oldSlug])
+}
+
+// =====================================================================
+// 11. EXTENSIBILITY (tables ship now; the admin builder UI and APIs come in Phase 4)
+//     Adds fields, sections and whole content types from the admin without a migration.
+// =====================================================================
+
+enum FieldType {
+  TEXT
+  LONG_TEXT
+  RICH_TEXT
+  NUMBER
+  BOOLEAN
+  DATE
+  URL
+  IMAGE
+  SELECT
+  MULTI_SELECT
+  LIST // list of strings
+  KEY_VALUE // list of {label, value}
+  LINK // link triple
+}
+
+enum BlockOwner {
+  EXAM
+  CLASS
+  SERIES
+  PAGE
+}
+
+/// "Add a field to Exam": the admin defines key/label/type once, the entity editor shows it automatically
+/// and the value is stored in that entity's `customFields` JSON. The public API returns it under `custom`.
+model CustomFieldDef {
+  id         String    @id @default(cuid())
+  entityType String // exam | class | series | freeTest | category | org | banner | homeSection | navItem | page ...
+  key        String // "salary", "cutoffNote"  (immutable once data exists)
+  label      String
+  type       FieldType
+  options    Json? // SELECT choices, min/max, regex, placeholder
+  helpText   String?   @db.VarChar(500)
+  required   Boolean   @default(false)
+  groupName  String? // tab / group in the editor
+  showOnSite Boolean   @default(true) // false = internal-only note
+  filterable Boolean   @default(false) // true = a developer adds a generated column + index in a normal migration
+  sort       Int       @default(0)
+  deprecated Boolean   @default(false) // hide instead of delete, data is kept
+  createdAt  DateTime  @default(now())
+
+  @@unique([entityType, key])
+}
+
+/// A reusable section TYPE the admin designs: e.g. "Salary & Perks" or "Cut-offs".
+/// `fields` describes the form (same field kinds as CustomFieldDef); `layout` picks one of the generic frontend renderers.
+model BlockType {
+  id      String  @id @default(cuid())
+  key     String  @unique // "salary-table"
+  label   String
+  layout  String // RICH_TEXT | LIST | CARDS | TABLE | ACCORDION | LINK_LIST | KEY_VALUE | STATS | IMAGE_TEXT | VIDEO
+  fields  Json // [{key,label,type,options,required}]
+  iconKey String?
+  active  Boolean @default(true)
+
+  blocks ContentBlock[]
+}
+
+/// A section the admin adds to a specific exam / class / series / page (e.g. "Salary" on SBI PO).
+/// ownerId has no FK (polymorphic): the owner's delete service removes its blocks in the same transaction.
+model ContentBlock {
+  id           String     @id @default(cuid())
+  ownerType    BlockOwner
+  ownerId      String
+  blockTypeKey String
+  anchorId     String? // sticky-nav id
+  title        String?    @db.VarChar(500)
+  data         Json // validated against BlockType.fields
+  sort         Int        @default(0)
+  visible      Boolean    @default(true)
+  publishAt    DateTime?
+  updatedAt    DateTime   @updatedAt
+
+  blockType BlockType @relation(fields: [blockTypeKey], references: [key])
+
+  @@index([ownerType, ownerId, sort])
+  @@index([blockTypeKey])
+}
+
+/// A brand-new content type with its own fields: Results, Notifications, Toppers, Testimonials, Blog, Study material ...
+model Collection {
+  id         String  @id @default(cuid())
+  key        String  @unique // "testimonials"
+  label      String
+  fields     Json // field definitions for the entry form
+  listLayout String? // renderer hint
+  hasPage    Boolean @default(false) // entries get /c/:key/:slug pages
+  active     Boolean @default(true)
+
+  entries CollectionEntry[]
+}
+
+model CollectionEntry {
+  id           String        @id @default(cuid())
+  collectionId String
+  slug         String?
+  title        String        @db.VarChar(500)
+  data         Json
+  status       PublishStatus @default(DRAFT)
+  sort         Int           @default(0)
+  publishedAt  DateTime?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  collection Collection @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+
+  @@unique([collectionId, slug])
+  @@index([collectionId, status, sort])
+}
+
+/// Free-form site settings that do not need a column: feature flags, third-party IDs, extra labels, theme tokens.
+model SettingEntry {
+  id        String   @id @default(cuid())
+  groupName String // "theme", "features", "integrations", "labels"
+  key       String
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@unique([groupName, key])
+}

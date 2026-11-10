@@ -1,0 +1,13 @@
+import { PrismaMariaDb } from '@prisma/adapter-mariadb'
+import { PrismaClient } from '../generated/prisma/client.js'
+
+/**
+ * Prisma 7 talks to MySQL / MariaDB through a driver adapter (the `mariadb` driver speaks both).
+ * One client per process; Fastify closes it on shutdown (see plugins/prisma.ts).
+ */
+export function createPrisma(databaseUrl: string) {
+  const adapter = new PrismaMariaDb(databaseUrl)
+  return new PrismaClient({ adapter })
+}
+
+export type Db = ReturnType<typeof createPrisma>
