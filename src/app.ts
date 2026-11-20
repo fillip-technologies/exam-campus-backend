@@ -58,8 +58,9 @@ export async function buildApp({ env, db }: BuildAppOptions) {
   app.decorate('cache', createMemoryCache())
   await app.register(authPlugin, { env })
 
-  // Uploaded files (local storage driver). Keys are random and never reused, so they can be cached forever.
-  if (env.STORAGE_DRIVER === 'local') {
+  // Files in UPLOAD_DIR (local storage driver). Served whatever STORAGE_DRIVER says now, so files uploaded before a
+  // switch to Cloudinary keep working. Keys are random and never reused, so they can be cached forever.
+  {
     const root = path.resolve(env.UPLOAD_DIR)
     mkdirSync(root, { recursive: true })
     await app.register(fastifyStatic, {

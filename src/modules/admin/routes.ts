@@ -4,7 +4,7 @@ import type { FastifyPluginAsync } from 'fastify'
 import { z } from 'zod'
 import type { Env } from '../../config/env.js'
 import { hashPassword } from '../../lib/password.js'
-import { createStorage, imageSize, newKey, sniffType } from '../../lib/storage.js'
+import { createStorages, imageSize, newKey, sniffType } from '../../lib/storage.js'
 import { hasRole, roleRank } from '../../plugins/auth.js'
 import { identifier, password, personName } from '../../shared/identity.js'
 import { role as roleSchema, type Role } from '../../shared/schemas.js'
@@ -31,10 +31,9 @@ export const adminRoutes: FastifyPluginAsync<{ env: Env }> = async (app, { env }
     const since = new Date(Date.now() - 7 * 86_400_000)
     const startOfDay = new Date()
     startOfDay.setHours(0, 0, 0, 0)
-    const [students, newStudents, waitlist, newMessages, latestMessages, examsByStatus, ordersToday, revenueToday] = await Promise.all([
+    const [students, newStudents, newMessages, latestMessages, examsByStatus, ordersToday, revenueToday] = await Promise.all([
       app.db.user.count({ where: { role: 'STUDENT' } }),
       app.db.user.count({ where: { role: 'STUDENT', createdAt: { gte: since } } }),
-      app.db.waitlistEntry.count(),
       app.db.contactMessage.count({ where: { status: 'NEW' } }),
       app.db.contactMessage.findMany({ orderBy: { createdAt: 'desc' }, take: 5 }),
       app.db.exam.groupBy({ by: ['status'], _count: { _all: true } }),
@@ -44,7 +43,6 @@ export const adminRoutes: FastifyPluginAsync<{ env: Env }> = async (app, { env }
     return {
       students,
       newStudents7d: newStudents,
-      waitlist,
       newMessages,
       latestMessages,
       examsByStatus: Object.fromEntries(examsByStatus.map((g) => [g.status, g._count._all])),
@@ -94,8 +92,9 @@ export const adminRoutes: FastifyPluginAsync<{ env: Env }> = async (app, { env }
     })
   })
 
-  // ---- media library (files on this server for now) ------------------------
-  const storage = createStorage(env)
+  // ---- media library: new uploads go to STORAGE_DRIVER (.env); each file remembers its driver -------
+  const storages = createStorages(env)
+  const storage = storages.active
   await app.register(multipart, { limits: { fileSize: env.MAX_UPLOAD_MB * 1024 * 1024, files: 1, fields: 5 } })
 
   app.post('/media', { preHandler: app.requireRole('EDITOR') }, async (req, reply) => {
@@ -118,6 +117,7 @@ export const adminRoutes: FastifyPluginAsync<{ env: Env }> = async (app, { env }
       const asset = await app.db.mediaAsset.create({
         data: {
           key,
+          storage: storage.driver,
           url: stored.url,
           mime: type.mime,
           sizeBytes: stored.sizeBytes,
@@ -162,8 +162,12 @@ export const adminRoutes: FastifyPluginAsync<{ env: Env }> = async (app, { env }
   /** Deletes the file too. Pages that still use its URL will show a broken image, so the admin UI warns first. */
   app.delete('/media/:id', { preHandler: app.requireRole('EDITOR') }, async (req, reply) => {
     const { id } = z.object({ id: z.string() }).parse(req.params)
+    const found = await app.db.mediaAsset.findUnique({ where: { id } })
+    if (!found) return reply.notFound('File not found')
+    const holder = storages.get(found.storage)
+    if (!holder) return reply.conflict(`This file is stored in ${found.storage}. Set CLOUDINARY_URL in .env to delete it.`)
+    await holder.delete(found.key)
     const asset = await app.db.mediaAsset.delete({ where: { id } })
-    await storage.delete(asset.key)
     await app.audit(req, { action: 'media.delete', entityType: 'media', entityId: id, diff: asset })
     return reply.code(204).send()
   })
@@ -250,30 +254,6 @@ export const adminRoutes: FastifyPluginAsync<{ env: Env }> = async (app, { env }
     const { password: _pw, ...logged } = body
     await app.audit(req, { action: 'user.update', entityType: 'user', entityId: id, diff: { ...logged, ...(body.password ? { password: 'changed' } : {}) } })
     return userOut(updated)
-  })
-
-  // ---- waitlist -------------------------------------------------------------
-  app.get('/waitlist', async (req, reply) => {
-    const q = z.object({ format: z.enum(['json', 'csv']).default('json'), page: z.coerce.number().int().min(1).default(1), pageSize: z.coerce.number().int().min(1).max(500).default(100) }).parse(req.query)
-    if (q.format === 'csv') {
-      const rows = await app.db.waitlistEntry.findMany({ orderBy: { createdAt: 'asc' } })
-      const csvCell = (v: string) => (/[",\n]/.test(v) || /^[=+\-@]/.test(v) ? `"${v.replace(/^([=+\-@])/, "'$1").replace(/"/g, '""')}"` : v)
-      const csv = ['email,source,created_at', ...rows.map((r) => [r.email, r.source, r.createdAt.toISOString()].map(csvCell).join(','))].join('\n')
-      await app.audit(req, { action: 'waitlist.export', entityType: 'waitlist', diff: { rows: rows.length } })
-      return reply.header('content-type', 'text/csv; charset=utf-8').header('content-disposition', 'attachment; filename="waitlist.csv"').send(csv)
-    }
-    const [items, total] = await Promise.all([
-      app.db.waitlistEntry.findMany({ orderBy: { createdAt: 'desc' }, skip: (q.page - 1) * q.pageSize, take: q.pageSize }),
-      app.db.waitlistEntry.count(),
-    ])
-    return { items, total, page: q.page, pageSize: q.pageSize }
-  })
-
-  app.delete('/waitlist/:id', { preHandler: app.requireRole('ADMIN') }, async (req, reply) => {
-    const { id } = z.object({ id: z.string() }).parse(req.params)
-    await app.db.waitlistEntry.delete({ where: { id } })
-    await app.audit(req, { action: 'waitlist.delete', entityType: 'waitlist', entityId: id })
-    return reply.code(204).send()
   })
 
   // ---- audit log (ADMIN) ------------------------------------------------------

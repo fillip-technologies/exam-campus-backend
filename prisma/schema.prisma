@@ -45,6 +45,12 @@ enum Role {
   SUPER_ADMIN
 }
 
+enum CourseMode {
+  LIVE
+  RECORDED
+  HYBRID
+}
+
 enum PublishStatus {
   DRAFT
   COMING_SOON // listed in menus, no hub page link yet
@@ -225,6 +231,8 @@ model SiteSetting {
   defaultMetaDescription String? @db.VarChar(500)
   defaultOgImageUrl      String? @db.Text
   analyticsId            String?
+
+  /// "Default redirect link": every Enroll / Buy / Start test button goes here unless the item has its own redirect link
 
   maintenanceMode Boolean  @default(false)
   updatedAt       DateTime @updatedAt
@@ -455,6 +463,8 @@ model Exam {
   customFields Json?
   id           String        @id @default(cuid())
   slug         String        @unique
+  /// "Redirect link": when set, clicks go to this URL instead of the page on this site
+  redirectUrl  String?       @db.Text
   name         String // "SBI PO"
   fullName     String?       @db.VarChar(500)
   categoryId   String
@@ -479,6 +489,8 @@ model Exam {
   patternSummary        String? @db.Text
   patternDisclaimer     String? @db.Text
   syllabusOfficialUrl   String? @db.Text
+  /// YouTube link for the "Free Live Demo Class" strip above the courses (empty = the first course's demo)
+  demoVideoUrl          String? @db.Text
 
   category ExamCategory     @relation(fields: [categoryId], references: [id])
   org      ExamOrganization @relation(fields: [orgId], references: [id])
@@ -494,6 +506,8 @@ model Exam {
   faqs                Faq[]
   series              TestSeries[]
   freeTests           FreeTest[]
+  courses             Course[]
+  faculty             Faculty[]
   relatedTo           ExamRelation[]           @relation("RelatedFrom")
   relatedFrom         ExamRelation[]           @relation("RelatedTo")
 
@@ -631,17 +645,23 @@ model ExamSyllabusSubject {
 /// Only add a paper once the file or online test really exists.
 model PreviousYearPaper {
   /// admin-defined extra fields, keyed by CustomFieldDef.key and validated against it
-  customFields Json?
-  id           String  @id @default(cuid())
-  examId       String
-  year         Int
-  stage        String? // "Prelims"
-  shift        String? // "Shift 1"
-  type         String? // "Memory based"
-  viewUrl      String? @db.Text
-  downloadUrl  String? @db.Text
-  testId       String? // online practice version (see Test)
-  visible      Boolean @default(true)
+  customFields    Json?
+  id              String    @id @default(cuid())
+  examId          String
+  year            Int
+  stage           String? // "Prelims"
+  shift           String? // "Shift 1"
+  type            String? // "Memory based"
+  heldOn          DateTime? @db.Date // exam date of this shift
+  questions       Int?
+  marks           Int?
+  durationMinutes Int?
+  languages       Json? // ["English", "Hindi"]
+  viewUrl         String?   @db.Text // PDF to open in the browser (media library URL)
+  downloadUrl     String?   @db.Text // PDF to download; empty = same file as viewUrl
+  practiceUrl     String?   @db.Text // "Attempt Online" link until the test engine (testId) is live
+  testId          String? // online practice version (see Test)
+  visible         Boolean   @default(true)
 
   exam Exam  @relation(fields: [examId], references: [id], onDelete: Cascade)
   test Test? @relation(fields: [testId], references: [id], onDelete: SetNull)
@@ -677,6 +697,8 @@ model AcademicClass {
   customFields   Json?
   id             String        @id @default(cuid())
   slug           String        @unique // "class-6"
+  /// "Redirect link": when set, clicks go to this URL instead of the page on this site
+  redirectUrl    String?       @db.Text
   name           String // "Class 6"
   grade          Int
   groupId        String
@@ -740,6 +762,8 @@ model TestSeries {
   customFields    Json?
   id              String        @id @default(cuid())
   slug            String        @unique // used by /enroll/:slug
+  /// "Redirect link": when set, clicks go to this URL instead of the page on this site
+  redirectUrl     String?       @db.Text
   examId          String?
   classId         String?
   title           String        @db.VarChar(500) // "SBI PO Complete Test Series"
@@ -768,6 +792,7 @@ model TestSeries {
   // so sold products are archived, never deleted.
   exam        Exam?           @relation(fields: [examId], references: [id], onDelete: Cascade)
   class       AcademicClass?  @relation(fields: [classId], references: [id], onDelete: Cascade)
+  coupons     CouponSeries[]
   tabItems    SeriesTabItem[]
   tests       Test[]
   orders      Order[]
@@ -776,6 +801,62 @@ model TestSeries {
   @@index([examId, sort])
   @@index([classId, sort])
   @@index([status])
+}
+
+/// Course package (live / recorded classes) on an exam hub's Courses section.
+model Course {
+  /// admin-defined extra fields, keyed by CustomFieldDef.key and validated against it
+  customFields   Json?
+  id             String        @id @default(cuid())
+  examId         String
+  /// "Enroll link": where Enroll Now goes (empty = the site's default redirect, else the exam's test series enroll page)
+  redirectUrl    String?       @db.Text
+  title          String        @db.VarChar(500)
+  subtitle       String?       @db.VarChar(500) // "Prelims + Mains"
+  mode           CourseMode    @default(LIVE)
+  languages      Json? // string[]
+  faculty        Json? // string[]: teacher names on the card
+  startDate      DateTime?     @db.Date
+  liveClasses    Int           @default(0)
+  recordedVideos Int           @default(0)
+  totalTests     Int           @default(0)
+  extraStats     Json? // [{label,value}] replaces the three counts above
+  includes       Json? // string[]
+  images         Json? // string[]: uploaded image URLs for the card's carousel
+  demoVideoUrl   String?       @db.Text // YouTube link: "Live Demo" button + a slide in the carousel
+  price          Int
+  mrp            Int
+  validityMonths Int           @default(12)
+  offerLabel     String? // "Bestseller"
+  isPrimary      Boolean       @default(false)
+  status         PublishStatus @default(DRAFT)
+  sort           Int           @default(0)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  exam    Exam           @relation(fields: [examId], references: [id], onDelete: Cascade)
+  coupons CouponCourse[]
+
+  @@index([examId, sort])
+}
+
+/// Teacher card in an exam hub's Faculty section.
+model Faculty {
+  id           String   @id @default(cuid())
+  examId       String
+  name         String
+  subject      String?
+  experience   String? // "12 years teaching Quant"
+  photoUrl     String?  @db.Text
+  demoVideoUrl String?  @db.Text // YouTube link: "Play Demo"
+  visible      Boolean  @default(true)
+  sort         Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  exam Exam @relation(fields: [examId], references: [id], onDelete: Cascade)
+
+  @@index([examId, sort])
 }
 
 /// Tabs under the hero: Popular, Latest, Exam-wise, Sectional, Topic-wise, PYQs, Free Tests.
@@ -812,6 +893,8 @@ model FreeTest {
   customFields    Json?
   id              String        @id @default(cuid())
   slug            String        @unique // /free-test/:slug
+  /// "Redirect link": when set, clicks go to this URL instead of the page on this site
+  redirectUrl     String?       @db.Text
   examId          String?
   classId         String?
   title           String        @db.VarChar(500) // "SBI PO Prelims Free Mock Test"
@@ -839,6 +922,8 @@ model Pass {
   customFields   Json?
   id             String  @id @default(cuid())
   slug           String  @unique // "pass"
+  /// "Redirect link": when set, clicks go to this URL instead of the page on this site
+  redirectUrl    String? @db.Text
   title          String
   validityMonths Int
   price          Int // rupees
@@ -1044,13 +1129,46 @@ model Coupon {
   code      String       @unique
   type      DiscountType
   value     Int // percent, or rupees for FLAT
+  /// text on the card, e.g. "Diwali offer" (empty = "Extra 10% off")
+  label     String?
   maxUses   Int?
   usedCount Int          @default(0)
   validFrom DateTime?
   validTo   DateTime?
   active    Boolean      @default(true)
+  /// shown on every course / every test series card (otherwise only on the ones picked below)
+  allCourses Boolean     @default(false)
+  allSeries  Boolean     @default(false)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @default(now()) @updatedAt
 
-  orders Order[]
+  orders  Order[]
+  courses CouponCourse[]
+  series  CouponSeries[]
+}
+
+/// Courses a coupon is picked for (when it is not for all courses).
+model CouponCourse {
+  couponId String
+  courseId String
+
+  coupon Coupon @relation(fields: [couponId], references: [id], onDelete: Cascade)
+  course Course @relation(fields: [courseId], references: [id], onDelete: Cascade)
+
+  @@id([couponId, courseId])
+  @@index([courseId])
+}
+
+/// Test series a coupon is picked for (when it is not for all series).
+model CouponSeries {
+  couponId String
+  seriesId String
+
+  coupon Coupon     @relation(fields: [couponId], references: [id], onDelete: Cascade)
+  series TestSeries @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+
+  @@id([couponId, seriesId])
+  @@index([seriesId])
 }
 
 /// One purchase. Exactly one of seriesId / passId (CHECK constraint). Prices are copied here in paise,
@@ -1280,6 +1398,8 @@ model AttemptAnswer {
 model MediaAsset {
   id           String   @id @default(cuid())
   key          String   @unique @db.VarChar(512) // storage key
+  /// which driver holds the file ("local" | "cloudinary"), so switching STORAGE_DRIVER keeps older files deletable
+  storage      String   @default("local") @db.VarChar(20)
   url          String   @db.Text
   mime         String
   sizeBytes    Int

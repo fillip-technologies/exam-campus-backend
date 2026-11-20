@@ -1,7 +1,7 @@
 import { Readable } from 'node:stream'
 import { describe, expect, it } from 'vitest'
 import { loadEnv } from '../src/config/env.js'
-import { cloudinarySignature, cloudinaryStorageForTest, cloudinaryTarget, parseCloudinaryUrl } from '../src/lib/storage.js'
+import { cloudinarySignature, cloudinaryStorageForTest, cloudinaryTarget, createStorages, parseCloudinaryUrl } from '../src/lib/storage.js'
 
 const cfg = { cloudName: 'demo-cloud', apiKey: '1234', apiSecret: 'shhh' }
 
@@ -69,5 +69,34 @@ describe('cloudinary storage', () => {
     const f = fakeFetch({ error: { message: 'Invalid Signature' } }, 401)
     const s = cloudinaryStorageForTest(cfg, 'ec', f.impl)
     await expect(s.put('a/b.png', Readable.from(Buffer.from('x')))).rejects.toThrow(/Invalid Signature/)
+  })
+})
+
+describe('storage driver switch (.env STORAGE_DRIVER)', () => {
+  const base = { DATABASE_URL: 'mysql://x', JWT_SECRET: 'x'.repeat(32) }
+
+  it('defaults to the upload folder on this server', () => {
+    const s = createStorages(loadEnv(base))
+    expect(s.active.driver).toBe('local')
+    expect(s.active.urlFor('a/b.png')).toBe('http://localhost:4000/uploads/a/b.png')
+    expect(s.get('cloudinary')).toBeNull() // no account configured
+  })
+
+  it('sends new uploads to Cloudinary but keeps local files reachable', () => {
+    const s = createStorages(loadEnv({ ...base, STORAGE_DRIVER: 'cloudinary', CLOUDINARY_URL: 'cloudinary://k:s@c' }))
+    expect(s.active.driver).toBe('cloudinary')
+    expect(s.get('local')?.driver).toBe('local')
+  })
+
+  it('still deletes Cloudinary files after switching back to local while CLOUDINARY_URL is set', () => {
+    const s = createStorages(loadEnv({ ...base, STORAGE_DRIVER: 'local', CLOUDINARY_URL: 'cloudinary://k:s@c' }))
+    expect(s.active.driver).toBe('local')
+    expect(s.get('cloudinary')?.driver).toBe('cloudinary')
+  })
+
+  it('needs a public upload URL for the local driver in production', () => {
+    const prod = { ...base, NODE_ENV: 'production', ALLOW_OTP_LOG_IN_PRODUCTION: 'true', STORAGE_DRIVER: 'local' }
+    expect(() => loadEnv(prod)).toThrow(/PUBLIC_UPLOAD_URL/)
+    expect(createStorages(loadEnv({ ...prod, PUBLIC_UPLOAD_URL: 'https://api.example.com/uploads/' })).active.urlFor('a.pdf')).toBe('https://api.example.com/uploads/a.pdf')
   })
 })

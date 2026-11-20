@@ -1,6 +1,6 @@
 import type { Db } from '../../lib/db.js'
 import { strings } from '../../lib/format.js'
-import { paths } from '../../lib/links.js'
+import { classTarget, examTarget, paths } from '../../lib/links.js'
 
 export interface SearchEntry {
   type: 'exam' | 'class' | 'category'
@@ -33,11 +33,11 @@ export async function buildSearchIndex(db: Db): Promise<SearchEntry[]> {
   const [exams, classes, categories] = await Promise.all([
     db.exam.findMany({
       where: { status: { in: ['PUBLISHED', 'COMING_SOON'] } },
-      select: { slug: true, name: true, fullName: true, status: true, aliases: true, category: { select: { label: true, active: true } } },
+      select: { slug: true, name: true, fullName: true, status: true, redirectUrl: true, aliases: true, category: { select: { label: true, active: true } } },
     }),
     db.academicClass.findMany({
       where: { status: { in: ['PUBLISHED', 'COMING_SOON'] } },
-      select: { slug: true, name: true, status: true, group: { select: { label: true } } },
+      select: { slug: true, name: true, status: true, redirectUrl: true, group: { select: { label: true } } },
       orderBy: { grade: 'asc' },
     }),
     db.examCategory.findMany({ where: { active: true, showInHomeGrid: true }, select: { slug: true, label: true, shortLabel: true } }),
@@ -49,7 +49,7 @@ export async function buildSearchIndex(db: Db): Promise<SearchEntry[]> {
       name: c.name,
       category: 'Academic',
       slug: c.slug,
-      href: c.status === 'PUBLISHED' ? paths.class(c.slug) : null,
+      href: classTarget(c),
       terms: [c.name, c.group.label].map(norm),
     })),
     ...exams
@@ -59,7 +59,7 @@ export async function buildSearchIndex(db: Db): Promise<SearchEntry[]> {
         name: e.name,
         category: e.category.label,
         slug: e.slug,
-        href: e.status === 'PUBLISHED' ? paths.exam(e.slug) : null,
+        href: examTarget(e),
         terms: [e.name, e.fullName ?? '', ...strings(e.aliases)].filter(Boolean).map(norm),
       })),
     ...categories.map((c) => ({

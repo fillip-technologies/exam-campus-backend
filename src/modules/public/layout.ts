@@ -1,16 +1,23 @@
 import type { Db } from '../../lib/db.js'
 import { activeNow } from '../../lib/format.js'
-import { LinkResolver, paths } from '../../lib/links.js'
+import { examTarget, LinkResolver } from '../../lib/links.js'
 
 const listedExam = { status: { in: ['PUBLISHED' as const, 'COMING_SOON' as const] } }
 
-/** Exam entry inside menus and the home grid. `href` is null until the exam has a published hub page. */
-export const menuExam = (e: { slug: string; name: string; status: string; org: { key: string } }) => ({
+/** Columns menuExam needs. */
+export const menuExamSelect = { slug: true, name: true, status: true, redirectUrl: true, org: { select: { key: true } } } as const
+
+/**
+ * Exam entry inside menus and the home grid. `href` is the exam's redirect link when set, else its hub page once
+ * published, else null. `external` tells the frontend not to append hub paths ("/previous-year-papers") to it.
+ */
+export const menuExam = (e: { slug: string; name: string; status: string; redirectUrl: string | null; org: { key: string } }) => ({
   name: e.name,
   slug: e.slug,
   org: e.org.key,
   hasPage: e.status === 'PUBLISHED',
-  href: e.status === 'PUBLISHED' ? paths.exam(e.slug) : null,
+  href: examTarget(e),
+  external: Boolean(e.redirectUrl),
 })
 
 /** Categories with their listed exams, ordered for menus. Shared by the nav (competitive / PYQ) and the home grid. */
@@ -22,7 +29,7 @@ export async function categoriesWithExams(db: Db, where: { showInCompetitiveMenu
       exams: {
         where: listedExam,
         orderBy: [{ menuSort: 'asc' }, { name: 'asc' }],
-        select: { slug: true, name: true, status: true, org: { select: { key: true } } },
+        select: menuExamSelect,
       },
     },
   })
@@ -31,9 +38,9 @@ export async function categoriesWithExams(db: Db, where: { showInCompetitiveMenu
 
 /** GET /public/layout: everything the header and footer need on every page. */
 export async function getLayout(db: Db) {
-  const [site, announcement, navItems, footerColumns, legal, social, suggestions, competitive, pyq] = await Promise.all([
+  const [site, announcements, navItems, footerColumns, legal, social, suggestions, competitive, pyq] = await Promise.all([
     db.siteSetting.findUnique({ where: { id: 1 } }),
-    db.announcement.findFirst({ where: activeNow(), orderBy: { sort: 'asc' } }),
+    db.announcement.findMany({ where: activeNow(), orderBy: { sort: 'asc' } }),
     db.navItem.findMany({
       where: { visible: true },
       orderBy: { sort: 'asc' },
@@ -60,7 +67,7 @@ export async function getLayout(db: Db) {
 
   const links = new LinkResolver(db)
   if (site) links.add({ linkType: site.headerCtaLinkType, linkRef: site.headerCtaLinkRef, linkUrl: site.headerCtaLinkUrl })
-  links.add(announcement)
+  links.add(...announcements)
   for (const n of navItems) {
     links.add(n, { linkType: n.footerLinkType, linkRef: n.footerLinkRef, linkUrl: n.footerLinkUrl }, ...n.links)
     for (const c of n.columns) links.add(...c.links)
@@ -95,14 +102,15 @@ export async function getLayout(db: Db) {
       maintenanceMode: site.maintenanceMode,
     },
 
-    announcement: announcement && {
-      id: announcement.id,
-      text: announcement.text,
-      mobileText: announcement.mobileText,
-      cta: link(announcement, announcement.ctaLabel),
-      theme: announcement.theme,
-      dismissible: announcement.dismissible,
-    },
+    // Every active announcement, in admin order: the bar scrolls through all of them in one row.
+    announcements: announcements.map((a) => ({
+      id: a.id,
+      text: a.text,
+      mobileText: a.mobileText,
+      cta: link(a, a.ctaLabel),
+      theme: a.theme,
+      dismissible: a.dismissible,
+    })),
 
     // Same shape as the frontend's data/nav.js navItems (+ the panel content inline).
     nav: navItems.map((n) => {

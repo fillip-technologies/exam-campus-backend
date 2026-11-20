@@ -1,7 +1,8 @@
 import type { Prisma } from '../../generated/prisma/client.js'
 import type { Db } from '../../lib/db.js'
 import { discountPercent, strings, validityLabel } from '../../lib/format.js'
-import { paths } from '../../lib/links.js'
+import { enrollTarget, examTarget } from '../../lib/links.js'
+import { type CouponPicker, loadCoupons } from '../../lib/coupons.js'
 
 export const cardInclude = {
   exam: {
@@ -9,6 +10,7 @@ export const cardInclude = {
       slug: true,
       name: true,
       status: true,
+      redirectUrl: true,
       org: { select: { key: true } },
       freeTests: { where: { status: 'PUBLISHED' }, select: { slug: true } },
     },
@@ -21,7 +23,7 @@ type CardRow = Prisma.TestSeriesGetPayload<{ include: typeof cardInclude }>
  * Home / explorer card, in the shape the frontend's CourseCard reads today (data/testSeries.js),
  * plus hrefs and counts the card used to compute from other static files.
  */
-export function seriesCard(s: CardRow) {
+export function seriesCard(s: CardRow, coupons?: CouponPicker) {
   const features = [
     { icon: 'ClipboardCheck', value: s.fullLengthTests, label: 'Full-length Mocks' },
     { icon: 'LayoutList', value: s.sectionalTests, label: 'Sectional Tests' },
@@ -32,7 +34,8 @@ export function seriesCard(s: CardRow) {
     slug: s.slug,
     exam: s.exam?.name ?? s.title,
     examSlug: s.exam?.slug ?? null,
-    examHref: s.exam?.status === 'PUBLISHED' ? paths.exam(s.exam.slug) : null,
+    examHref: s.exam ? examTarget(s.exam) : null,
+    examExternal: Boolean(s.exam?.redirectUrl),
     org: s.exam?.org.key ?? null,
     title: s.title,
     subtitle: s.subtitle,
@@ -45,11 +48,13 @@ export function seriesCard(s: CardRow) {
     mrp: s.mrp,
     discountPercent: discountPercent(s.price, s.mrp),
     offer: s.offerLabel,
+    coupon: coupons?.forSeries(s.id, s.price) ?? null,
     image: s.posterUrl,
     totalTests: s.totalTests || features.reduce((n, f) => n + f.value, 0),
     features,
     freeTests: s.exam?.freeTests.length ?? 0,
-    href: paths.enroll(s.slug),
+    href: enrollTarget(s),
+    external: Boolean(s.redirectUrl),
   }
 }
 
@@ -93,6 +98,7 @@ export async function getSeriesCards(db: Db, q: SeriesQuery) {
     categoryIds = hero.categories.map((c) => c.examCategoryId)
   }
 
+  const coupons = await loadCoupons(db)
   const items =
     categoryIds && categoryIds.length === 0
       ? [] // a chip with no categories: "no test series yet"
@@ -113,7 +119,7 @@ export async function getSeriesCards(db: Db, q: SeriesQuery) {
   return {
     tab: { id: tab.key, label: tab.label, heading: tab.heading },
     category,
-    items: ordered.slice(0, Number.isFinite(limit) ? limit : undefined).map(seriesCard),
+    items: ordered.slice(0, Number.isFinite(limit) ? limit : undefined).map((s) => seriesCard(s, coupons)),
   }
 }
 

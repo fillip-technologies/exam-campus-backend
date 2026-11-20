@@ -38,8 +38,9 @@ const schema = z
 
     // ---- files ----
     /**
-     * Where uploads are stored. "cloudinary" = Cloudinary (images + PDFs, served from its CDN);
-     * "local" = UPLOAD_DIR on this server, served at /uploads/* (development / tests without credentials).
+     * Where NEW uploads are stored. "cloudinary" = Cloudinary (images + PDFs, served from its CDN);
+     * "local" = UPLOAD_DIR on this server, served by the API at /uploads/*. Switching later is safe: older files
+     * stay where they were uploaded and keep working.
      */
     STORAGE_DRIVER: z.enum(['local', 'cloudinary']).default('local'),
     /** cloudinary://<api_key>:<api_secret>@<cloud_name> (Cloudinary console → API Keys → "API environment variable") */
@@ -53,13 +54,15 @@ const schema = z
       .regex(/^[a-z0-9][a-z0-9_-]{0,60}$/, 'Lowercase letters, numbers, - and _')
       .default('examcampus'),
     UPLOAD_DIR: z.string().default('uploads'),
-    /** Public base URL of uploaded files; default = this API's /uploads path. */
+    /** Public base URL of files in UPLOAD_DIR (https://api.examcampus.in/uploads); default = http://localhost:PORT/uploads. */
     PUBLIC_UPLOAD_URL: z.string().optional(),
     MAX_UPLOAD_MB: z.coerce.number().positive().max(100).default(10),
   })
   .superRefine((v, ctx) => {
     if (v.STORAGE_DRIVER === 'cloudinary' && !v.CLOUDINARY_URL)
       ctx.addIssue({ code: 'custom', path: ['CLOUDINARY_URL'], message: 'STORAGE_DRIVER=cloudinary needs CLOUDINARY_URL' })
+    if (v.NODE_ENV === 'production' && v.STORAGE_DRIVER === 'local' && !v.PUBLIC_UPLOAD_URL)
+      ctx.addIssue({ code: 'custom', path: ['PUBLIC_UPLOAD_URL'], message: 'STORAGE_DRIVER=local in production needs PUBLIC_UPLOAD_URL (e.g. https://api.examcampus.in/uploads)' })
     if (v.NODE_ENV === 'production' && v.OTP_DELIVERY === 'log' && !v.ALLOW_OTP_LOG_IN_PRODUCTION)
       ctx.addIssue({ code: 'custom', path: ['OTP_DELIVERY'], message: 'Set a real OTP delivery provider before production' })
   })

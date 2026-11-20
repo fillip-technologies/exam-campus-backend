@@ -1,11 +1,15 @@
 import type { Prisma } from '../../generated/prisma/client.js'
 import type { Db } from '../../lib/db.js'
 import { isoDate, list, strings, validityLabel } from '../../lib/format.js'
-import { LinkResolver, paths } from '../../lib/links.js'
-import { menuExam } from './layout.js'
+import { type CouponPicker, loadCoupons } from '../../lib/coupons.js'
+import { classTarget, enrollTarget, freeTestTarget, LinkResolver, pageRedirect } from '../../lib/links.js'
+import { menuExam, menuExamSelect } from './layout.js'
 
 const bySort = { orderBy: { sort: 'asc' as const } }
-const publishedSeries = { where: { status: 'PUBLISHED' as const }, orderBy: [{ isPrimary: 'desc' as const }, { sort: 'asc' as const }] }
+const publishedSeries = {
+  where: { status: 'PUBLISHED' as const },
+  orderBy: [{ isPrimary: 'desc' as const }, { sort: 'asc' as const }],
+}
 
 /** A slug that no longer exists but was renamed: the caller answers 404 with `redirect` so the frontend can navigate. */
 export async function findRedirect(db: Db, entityType: string, slug: string) {
@@ -14,7 +18,7 @@ export async function findRedirect(db: Db, entityType: string, slug: string) {
 }
 
 /** Hub series in the shape of data/exams/sbiPo.js testSeries[]. */
-const hubSeries = (s: Prisma.TestSeriesGetPayload<object>) => ({
+const hubSeries = (s: Prisma.TestSeriesGetPayload<object>, coupons?: CouponPicker) => ({
   id: s.slug,
   slug: s.slug,
   image: s.posterUrl,
@@ -30,10 +34,14 @@ const hubSeries = (s: Prisma.TestSeriesGetPayload<object>) => ({
   validity: validityLabel(s.validityMonths),
   price: s.price,
   originalPrice: s.mrp,
+  offer: s.offerLabel,
+  coupon: coupons?.forSeries(s.id, s.price) ?? null,
   includes: strings(s.includes),
   isPrimary: s.isPrimary,
-  enrollUrl: paths.enroll(s.slug),
-  detailsUrl: '#test-series',
+  enrollUrl: enrollTarget(s),
+  // its own redirect link replaces "View details" too; otherwise it scrolls to the hub's series list
+  detailsUrl: s.redirectUrl || '#test-series',
+  external: Boolean(s.redirectUrl),
 })
 
 const hubFreeTest = (t: Prisma.FreeTestGetPayload<object>) => ({
@@ -43,8 +51,41 @@ const hubFreeTest = (t: Prisma.FreeTestGetPayload<object>) => ({
   durationMinutes: t.durationMinutes,
   type: t.testKindLabel,
   available: Boolean(t.testId),
-  startUrl: paths.freeTest(t.slug),
+  startUrl: freeTestTarget(t),
+  external: Boolean(t.redirectUrl),
 })
+
+/** Hub course card (CoursesSection). Enroll: its own link, else the site default, else the exam's test series enroll page. */
+const hubCourse = (c: Prisma.CourseGetPayload<object>, examSlug: string, coupons: CouponPicker) => {
+  const images = strings(c.images).map((url) => ({ type: 'image' as const, url, alt: '' }))
+  const video = c.demoVideoUrl ? [{ type: 'youtube' as const, url: c.demoVideoUrl, title: 'Demo class' }] : []
+  const enrollUrl = c.redirectUrl || `/enroll/${examSlug}`
+  return {
+    id: c.id,
+    title: c.title,
+    subtitle: c.subtitle,
+    mode: c.mode,
+    languages: strings(c.languages),
+    faculty: strings(c.faculty),
+    startDate: isoDate(c.startDate),
+    liveClasses: c.liveClasses,
+    recordedVideos: c.recordedVideos,
+    totalTests: c.totalTests,
+    stats: list<{ label: string; value: string | number }>(c.extraStats),
+    includes: strings(c.includes),
+    // images first, the demo video last: the card opens on a picture
+    media: [...images, ...video],
+    demoVideoUrl: c.demoVideoUrl,
+    price: c.price,
+    originalPrice: c.mrp,
+    validity: validityLabel(c.validityMonths),
+    offer: c.offerLabel,
+    coupon: coupons.forCourse(c.id, c.price),
+    isPrimary: c.isPrimary,
+    enrollUrl,
+    external: /^https?:\/\//.test(enrollUrl),
+  }
+}
 
 const faq = (f: { question: string; answer: string }) => ({ question: f.question, answer: f.answer })
 
@@ -61,16 +102,61 @@ export async function getExamDirectory(db: Db) {
       exams: {
         where: { status: { in: ['PUBLISHED', 'COMING_SOON'] } },
         orderBy: [{ menuSort: 'asc' }, { name: 'asc' }],
-        select: { slug: true, name: true, fullName: true, status: true, org: { select: { key: true } } },
+        select: {
+          ...menuExamSelect,
+          fullName: true,
+          _count: { select: { papers: { where: { visible: true } } } },
+        },
       },
     },
   })
   return {
     categories: categories
       .filter((c) => c.exams.length > 0)
-      .map((c) => ({ id: c.slug, label: c.label, icon: c.iconKey, exams: c.exams.map((e) => ({ ...menuExam(e), fullName: e.fullName })) })),
+      .map((c) => ({
+        id: c.slug,
+        label: c.label,
+        icon: c.iconKey,
+        exams: c.exams.map((e) => ({ ...menuExam(e), fullName: e.fullName, paperCount: e._count.papers })),
+      })),
   }
 }
+
+type PaperRow = {
+  id: string
+  year: number
+  stage: string | null
+  shift: string | null
+  type: string | null
+  heldOn: Date | null
+  questions: number | null
+  marks: number | null
+  durationMinutes: number | null
+  languages: unknown
+  viewUrl: string | null
+  downloadUrl: string | null
+  practiceUrl: string | null
+  testId: string | null
+}
+
+/** One previous year paper in the shape of the frontend's lib/papers.js. One uploaded PDF serves both View and Download. */
+const paper = (p: PaperRow) => ({
+  id: p.id,
+  year: p.year,
+  stage: p.stage,
+  shift: p.shift,
+  type: p.type,
+  heldOn: isoDate(p.heldOn),
+  questions: p.questions,
+  marks: p.marks,
+  durationMinutes: p.durationMinutes,
+  languages: strings(p.languages),
+  viewUrl: p.viewUrl ?? p.downloadUrl,
+  downloadUrl: p.downloadUrl ?? p.viewUrl,
+  // until the test engine (Phase 3) gives `testId` an attempt route, "Attempt Online" uses the admin's link
+  practiceUrl: p.practiceUrl,
+  hasOnlineTest: Boolean(p.testId),
+})
 
 /** GET /public/exams/:slug: the full hub, in the shape of data/exams/sbiPo.js. Only PUBLISHED exams have a hub. */
 export async function getExamHub(db: Db, slug: string) {
@@ -90,19 +176,24 @@ export async function getExamHub(db: Db, slug: string) {
       faqs: { where: { active: true }, ...bySort },
       series: publishedSeries,
       freeTests: { where: { status: 'PUBLISHED' }, ...bySort },
+      courses: { where: { status: 'PUBLISHED' }, orderBy: [{ isPrimary: 'desc' }, { sort: 'asc' }] },
+      faculty: { where: { visible: true }, ...bySort },
       relatedTo: {
         ...bySort,
-        include: { related: { select: { slug: true, name: true, fullName: true, status: true, org: { select: { key: true } } } } },
+        include: { related: { select: { ...menuExamSelect, fullName: true } } },
       },
     },
   })
   if (!e) return null
+  const coupons = await loadCoupons(db)
 
   const links = new LinkResolver(db).add(...e.resources)
   await links.load()
 
   return {
     slug: e.slug,
+    /** set = the frontend forwards /exams/<slug> (and its papers page) to this URL */
+    redirectUrl: e.redirectUrl,
     name: e.name,
     fullName: e.fullName,
     category: e.category.label,
@@ -113,7 +204,11 @@ export async function getExamHub(db: Db, slug: string) {
     description: e.description,
     status: e.statusLabel ? { label: e.statusLabel, tone: (e.statusTone ?? 'INFO').toLowerCase() } : null,
     quickInfo: e.quickInfo.map((q) => ({ label: q.label, value: q.value })),
-    testSeries: e.series.map(hubSeries),
+    testSeries: e.series.map((s) => hubSeries(s, coupons)),
+    courses: e.courses.map((c) => hubCourse(c, e.slug, coupons)),
+    faculty: e.faculty.map((t) => ({ id: t.id, name: t.name, subject: t.subject, experience: t.experience, photo: t.photoUrl, demoVideoUrl: t.demoVideoUrl })),
+    /** "Free Live Demo Class" strip; null = the first course's demo video */
+    demoVideoUrl: e.demoVideoUrl,
     latestUpdates: e.updates.map((u) => ({
       date: isoDate(u.date),
       title: u.title,
@@ -149,17 +244,8 @@ export async function getExamHub(db: Db, slug: string) {
       officialUrl: e.syllabusOfficialUrl,
       stages: e.syllabusStages.map((st) => ({ name: st.name, subjects: st.subjects.map((s) => ({ name: s.name, topics: strings(s.topics) })) })),
     },
-    previousYearPapers: e.papers.map((p) => ({
-      year: p.year,
-      stage: p.stage,
-      shift: p.shift,
-      type: p.type,
-      viewUrl: p.viewUrl,
-      downloadUrl: p.downloadUrl,
-      // online practice version: the attempt route arrives with the test engine (Phase 3)
-      hasOnlineTest: Boolean(p.testId),
-    })),
-    freeTests: e.freeTests.map(hubFreeTest),
+    previousYearPapers: e.papers.map(paper),
+    freeTests: e.freeTests.map((t) => hubFreeTest(t)),
     resources: e.resources.map((r) => ({ type: r.type, title: r.title, description: r.description, href: links.href(r) })),
     faqs: e.faqs.map(faq),
     relatedExams: e.relatedTo
@@ -188,6 +274,7 @@ export async function getClassHub(db: Db, slug: string) {
     },
   })
   if (!c) return null
+  const coupons = await loadCoupons(db)
 
   const others = await db.academicClass.findMany({
     where: { id: { not: c.id }, status: { in: ['PUBLISHED', 'COMING_SOON'] } },
@@ -197,6 +284,8 @@ export async function getClassHub(db: Db, slug: string) {
 
   return {
     slug: c.slug,
+    /** set = the frontend forwards /academic/<slug> to this URL */
+    redirectUrl: c.redirectUrl,
     name: c.name,
     grade: c.grade,
     stage: c.group.label,
@@ -204,17 +293,17 @@ export async function getClassHub(db: Db, slug: string) {
     boards: strings(c.boards),
     description: c.description,
     quickInfo: c.quickInfo.map((q) => ({ label: q.label, value: q.value })),
-    testSeries: c.series.map(hubSeries),
+    testSeries: c.series.map((s) => hubSeries(s, coupons)),
     subjects: c.subjects.map((s) => ({ name: s.name, summary: s.summary, testTypes: strings(s.testTypes), topics: strings(s.topics) })),
     howItWorks: c.steps.map((s) => ({ title: s.title, text: s.text })),
-    freeTests: c.freeTests.map(hubFreeTest),
+    freeTests: c.freeTests.map((t) => hubFreeTest(t)),
     faqs: c.faqs.map(faq),
     relatedClasses: others.map((o) => ({
       slug: o.slug,
       name: o.name,
       stage: o.group.label,
       hasPage: o.status === 'PUBLISHED',
-      href: o.status === 'PUBLISHED' ? paths.class(o.slug) : null,
+      href: classTarget(o),
     })),
     seo: { title: c.seoTitle ?? c.name, description: c.seoDescription ?? c.description, ogImageUrl: c.ogImageUrl },
   }
@@ -239,6 +328,8 @@ export async function getProduct(db: Db, slug: string) {
       price: pass.price,
       originalPrice: pass.mrp,
       includes: strings(pass.benefits),
+      /** set = /enroll/<slug> forwards here instead of showing our enroll page */
+      redirectUrl: pageRedirect(pass),
     }
   }
   const series =
@@ -246,7 +337,7 @@ export async function getProduct(db: Db, slug: string) {
     (await db.testSeries.findFirst({ where: { status: 'PUBLISHED', exam: { is: { slug } } }, orderBy: [{ isPrimary: 'desc' }, { sort: 'asc' }] })) ??
     (await db.testSeries.findFirst({ where: { status: 'PUBLISHED', class: { is: { slug } } }, orderBy: [{ isPrimary: 'desc' }, { sort: 'asc' }] }))
   if (!series) return null
-  return { type: 'SERIES' as const, ...hubSeries(series) }
+  return { type: 'SERIES' as const, ...hubSeries(series, await loadCoupons(db)), redirectUrl: pageRedirect(series) }
 }
 
 // ---------------------------------------------------------------------------

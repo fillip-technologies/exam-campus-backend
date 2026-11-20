@@ -42,7 +42,8 @@ async function cleanup() {
 }
 
 beforeAll(async () => {
-  app = await buildApp({ env: { ...loadEnv(), NODE_ENV: 'test', LOG_LEVEL: 'silent' } })
+  // local driver and no Cloudinary account, whatever .env says, so uploads never leave this machine
+  app = await buildApp({ env: { ...loadEnv(), NODE_ENV: 'test', LOG_LEVEL: 'silent', STORAGE_DRIVER: 'local', CLOUDINARY_URL: undefined } })
   await cleanup()
   await app.db.user.create({ data: { name: 'ZZ Editor', email: EDITOR.email, role: 'EDITOR', passwordHash: await hashPassword(EDITOR.password) } })
 })
@@ -240,7 +241,7 @@ describe('admin API', () => {
     }
     const up = await app.inject({ method: 'POST', url: '/api/v1/admin/media', ...form('logo.png', png, 'image/png') })
     expect(up.statusCode).toBe(201)
-    expect(up.json()).toMatchObject({ mime: 'image/png', width: 2, height: 3, folder: 'zz-admin' })
+    expect(up.json()).toMatchObject({ mime: 'image/png', width: 2, height: 3, folder: 'zz-admin', storage: 'local' })
     const key = up.json().key as string
     const served = await app.inject({ url: `/uploads/${key}` })
     expect(served.statusCode).toBe(200)
@@ -251,5 +252,15 @@ describe('admin API', () => {
 
     expect((await call('DELETE', `/media/${up.json().id}`)).statusCode).toBe(204)
     expect((await app.inject({ url: `/uploads/${key}` })).statusCode).toBe(404)
+  })
+
+  it('keeps a Cloudinary file when this server cannot reach Cloudinary', async () => {
+    const asset = await app.db.mediaAsset.create({
+      data: { key: 'zz-admin/2026/11/remote.png', storage: 'cloudinary', url: 'https://res.cloudinary.com/x/image/upload/remote.png', mime: 'image/png', sizeBytes: 1, folder: 'zz-admin' },
+    })
+    const res = await call('DELETE', `/media/${asset.id}`)
+    expect(res.statusCode).toBe(409)
+    expect(res.json().message).toMatch(/CLOUDINARY_URL/)
+    expect(await app.db.mediaAsset.findUnique({ where: { id: asset.id } })).not.toBeNull()
   })
 })

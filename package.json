@@ -19,6 +19,7 @@
     "db:deploy": "prisma migrate deploy",
     "db:reset": "prisma migrate reset --force",
     "db:seed": "prisma db seed",
+    "db:seed:courses": "tsx prisma/seed/courses-run.ts",
     "db:studio": "prisma studio",
     "postinstall": "prisma generate",
     "admin:create": "tsx scripts/create-admin.ts"

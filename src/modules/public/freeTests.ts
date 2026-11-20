@@ -1,7 +1,7 @@
 import type { Prisma } from '../../generated/prisma/client.js'
 import type { Db } from '../../lib/db.js'
 import { strings } from '../../lib/format.js'
-import { paths } from '../../lib/links.js'
+import { freeTestTarget, pageRedirect } from '../../lib/links.js'
 
 const include = {
   exam: { select: { slug: true, name: true, org: { select: { key: true } }, category: { select: { slug: true, label: true, shortLabel: true } } } },
@@ -25,7 +25,9 @@ export const freeTestCard = (t: Row) => ({
   highlights: strings(t.highlights),
   featured: t.featured,
   available: Boolean(t.testId), // false until the test engine (Phase 3) has the real test
-  href: paths.freeTest(t.slug),
+  href: freeTestTarget(t),
+  /** /free-test/:slug forwards here instead of showing our start page */
+  redirectUrl: pageRedirect(t),
 })
 
 /** GET /public/free-tests?category=: exam free tests (the home list), optionally for one category. */
@@ -44,17 +46,18 @@ export async function getFreeTests(db: Db, category?: string) {
   ])
   return {
     filters: filters.map((c) => ({ id: c.slug, label: c.shortLabel ?? c.label })),
-    items: tests.map(freeTestCard),
+    items: tests.map((t) => freeTestCard(t)),
   }
 }
 
 /** GET /public/free-tests/:slug: same lookup order as the frontend's getFreeTestBySlug (free test -> exam -> class). */
 export async function getFreeTestBySlug(db: Db, slug: string) {
   const published = { status: 'PUBLISHED' as const }
+  const freeTestCard_ = (t: Row) => freeTestCard(t)
   const direct = await db.freeTest.findFirst({ where: { slug, ...published }, include })
-  if (direct) return freeTestCard(direct)
+  if (direct) return freeTestCard_(direct)
   const viaExam = await db.freeTest.findFirst({ where: { ...published, exam: { is: { slug } } }, orderBy: { sort: 'asc' }, include })
-  if (viaExam) return freeTestCard(viaExam)
+  if (viaExam) return freeTestCard_(viaExam)
   const viaClass = await db.freeTest.findFirst({ where: { ...published, class: { is: { slug } } }, orderBy: { sort: 'asc' }, include })
-  return viaClass ? freeTestCard(viaClass) : null
+  return viaClass ? freeTestCard_(viaClass) : null
 }

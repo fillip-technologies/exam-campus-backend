@@ -61,6 +61,14 @@ const slugRedirect = (entityType: string) => async (tx: Tx, row: RowData, _input
   })
 }
 
+/** Optional YouTube link (watch, youtu.be, shorts, embed or live URL). */
+const youtubeUrl = () =>
+  f
+    .optUrl()
+    .refine((v) => v == null || /^https:\/\/(www\.|m\.)?(youtube\.com|youtu\.be)\//.test(v), 'Use a YouTube link, e.g. https://www.youtube.com/watch?v=...')
+
+const priceRule = (row: RowData) => (Number(row.price) > Number(row.mrp) ? [{ path: 'price', message: 'Price cannot be more than the MRP' }] : [])
+
 const stringArray = (v: unknown) => (Array.isArray(v) ? (v as string[]) : [])
 
 // ---------------------------------------------------------------------------
@@ -347,6 +355,7 @@ export const resources: Resource[] = [
     relationKeys: ['relatedExamIds'],
     fields: z.object({
       slug: f.slug(),
+      redirectUrl: f.optUrl(),
       name: f.str(),
       fullName: f.optStr(500),
       categoryId: f.id(),
@@ -365,6 +374,7 @@ export const resources: Resource[] = [
       patternSummary: f.optText(),
       patternDisclaimer: f.optText(),
       syllabusOfficialUrl: f.optUrl(),
+      demoVideoUrl: youtubeUrl(),
       relatedExamIds: z.array(f.id()).max(30).optional(),
       customFields: f.json(),
     }),
@@ -468,15 +478,21 @@ export const resources: Resource[] = [
     model: 'previousYearPaper',
     entityType: 'previousYearPaper',
     filters: { examId: f.id().optional() },
-    orderBy: [{ year: 'desc' }],
+    orderBy: [{ year: 'desc' }, { stage: 'asc' }, { shift: 'asc' }],
     fields: z.object({
       examId: f.id(),
       year: f.int(1950, 2100),
       stage: f.optStr(),
       shift: f.optStr(),
       type: f.optStr(),
+      heldOn: f.optDate(),
+      questions: f.optInt(1, 10_000),
+      marks: f.optInt(1, 10_000),
+      durationMinutes: f.optInt(1, 24 * 60),
+      languages: f.stringList(),
       viewUrl: f.optUrl(),
       downloadUrl: f.optUrl(),
+      practiceUrl: f.optUrl(),
       testId: f.optId(),
       visible: f.bool(),
       customFields: f.json(),
@@ -521,6 +537,7 @@ export const resources: Resource[] = [
     listInclude: { group: { select: { label: true } } },
     fields: z.object({
       slug: f.slug(),
+      redirectUrl: f.optUrl(),
       name: f.str(),
       grade: f.int(1, 12),
       groupId: f.id(),
@@ -561,6 +578,7 @@ export const resources: Resource[] = [
     listInclude: { exam: { select: { name: true } }, class: { select: { name: true } } },
     fields: z.object({
       slug: f.slug(),
+      redirectUrl: f.optUrl(),
       examId: f.optId(),
       classId: f.optId(),
       title: f.str(500),
@@ -607,6 +625,7 @@ export const resources: Resource[] = [
     listInclude: { exam: { select: { name: true } }, class: { select: { name: true } } },
     fields: z.object({
       slug: f.slug(),
+      redirectUrl: f.optUrl(),
       examId: f.optId(),
       classId: f.optId(),
       title: f.str(500),
@@ -623,12 +642,70 @@ export const resources: Resource[] = [
     rules: hubOwnerRule,
   },
   {
+    path: 'courses',
+    model: 'course',
+    entityType: 'course',
+    publishable: true,
+    sortable: true,
+    search: ['title'],
+    filters: { status: f.status(), examId: f.id().optional() },
+    listInclude: { exam: { select: { name: true } } },
+    fields: z.object({
+      examId: f.id(),
+      redirectUrl: f.optUrl(),
+      title: f.str(500),
+      subtitle: f.optStr(500),
+      mode: z.enum(['LIVE', 'RECORDED', 'HYBRID']).optional(),
+      languages: f.stringList(),
+      faculty: f.stringList(),
+      startDate: f.optDate(),
+      liveClasses: f.int().optional(),
+      recordedVideos: f.int().optional(),
+      totalTests: f.int().optional(),
+      extraStats: labelValueList.nullable().optional(),
+      includes: f.stringList(),
+      images: z.array(z.string().trim().min(1).max(2048).regex(/^(https?:\/\/|\/)/, 'Use a full URL or a site path')).max(20).nullable().optional(),
+      demoVideoUrl: youtubeUrl(),
+      price: f.int(0, 1_000_000),
+      mrp: f.int(0, 1_000_000),
+      validityMonths: f.int(1, 120).optional(),
+      offerLabel: f.optStr(),
+      isPrimary: f.bool(),
+      status: f.status(),
+      sort: f.sort(),
+      customFields: f.json(),
+    }),
+    rules: priceRule,
+    afterWrite: async (tx, row) => {
+      // one primary course per exam (the mobile "Enroll" bar uses it)
+      if (row.isPrimary) await tx.course.updateMany({ where: { id: { not: row.id }, examId: String(row.examId), isPrimary: true }, data: { isPrimary: false } })
+    },
+  },
+  {
+    path: 'faculty',
+    model: 'faculty',
+    entityType: 'faculty',
+    sortable: true,
+    search: ['name', 'subject'],
+    filters: { examId: f.id().optional() },
+    fields: z.object({
+      examId: f.id(),
+      name: f.str(),
+      subject: f.optStr(),
+      experience: f.optStr(),
+      photoUrl: f.optUrl(),
+      demoVideoUrl: youtubeUrl(),
+      ...visible,
+    }),
+  },
+  {
     path: 'passes',
     model: 'pass',
     entityType: 'pass',
     write: 'ADMIN',
     fields: z.object({
       slug: f.slug(),
+      redirectUrl: f.optUrl(),
       title: f.str(),
       validityMonths: f.int(1, 120),
       price: f.int(0, 1_000_000),
@@ -637,7 +714,61 @@ export const resources: Resource[] = [
       active: f.bool(),
       customFields: f.json(),
     }),
-    rules: (row) => (Number(row.price) > Number(row.mrp) ? [{ path: 'price', message: 'Price cannot be more than the MRP' }] : []),
+    rules: priceRule,
+  },
+  {
+    path: 'coupons',
+    model: 'coupon',
+    entityType: 'coupon',
+    write: 'ADMIN',
+    search: ['code', 'label'],
+    orderBy: [{ createdAt: 'desc' }],
+    listInclude: { _count: { select: { series: true, courses: true } } },
+    include: { courses: { select: { courseId: true } }, series: { select: { seriesId: true } } },
+    relationKeys: ['courseIds', 'seriesIds'],
+    fields: z.object({
+      code: z
+        .string()
+        .trim()
+        .min(3, 'At least 3 characters')
+        .max(40)
+        .transform((v) => v.toUpperCase())
+        .refine((v) => /^[A-Z0-9_-]+$/.test(v), 'Letters, numbers, - and _ only'),
+      type: z.enum(['PERCENT', 'FLAT']),
+      value: f.int(1, 1_000_000),
+      label: f.optStr(),
+      maxUses: f.optInt(1, 10_000_000),
+      validFrom: f.optDateTime(),
+      validTo: f.optDateTime(),
+      active: f.bool(),
+      allCourses: f.bool(),
+      allSeries: f.bool(),
+      courseIds: z.array(f.id()).max(500).optional(),
+      seriesIds: z.array(f.id()).max(500).optional(),
+    }),
+    present: (row) => {
+      const { courses, series, ...rest } = row as RowData & { courses?: { courseId: string }[]; series?: { seriesId: string }[] }
+      return {
+        ...rest,
+        ...(courses ? { courseIds: courses.map((c) => c.courseId) } : {}),
+        ...(series ? { seriesIds: series.map((s) => s.seriesId) } : {}),
+      }
+    },
+    afterWrite: async (tx, row, input) => {
+      // the picked lists replace the old ones; "all" clears them (they would do nothing)
+      if (input.courseIds || row.allCourses) {
+        await tx.couponCourse.deleteMany({ where: { couponId: row.id } })
+        if (!row.allCourses) await tx.couponCourse.createMany({ data: stringArray(input.courseIds).map((courseId) => ({ couponId: row.id, courseId })), skipDuplicates: true })
+      }
+      if (input.seriesIds || row.allSeries) {
+        await tx.couponSeries.deleteMany({ where: { couponId: row.id } })
+        if (!row.allSeries) await tx.couponSeries.createMany({ data: stringArray(input.seriesIds).map((seriesId) => ({ couponId: row.id, seriesId })), skipDuplicates: true })
+      }
+    },
+    rules: (row) => [
+      ...(row.type === 'PERCENT' && Number(row.value) > 100 ? [{ path: 'value', message: 'A percent discount cannot be more than 100' }] : []),
+      ...(row.validFrom && row.validTo && new Date(String(row.validFrom)) > new Date(String(row.validTo)) ? [{ path: 'validTo', message: 'Ends before it starts' }] : []),
+    ],
   },
 
   // ===== Content ============================================================

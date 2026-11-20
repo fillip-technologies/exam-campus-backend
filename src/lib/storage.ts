@@ -7,23 +7,41 @@ import type { Readable } from 'node:stream'
 import type { Env } from '../config/env.js'
 
 /**
- * File storage behind one small interface:
- *   "cloudinary"  images and PDFs in Cloudinary, served from its CDN (production)
- *   "local"       files on this server's disk, served by the API at /uploads/* (development, tests)
- * `key` is our own path ("posters/2026/11/k3j2h4.jpg"); MediaAsset stores it, so delete works the same for every driver.
+ * File storage behind one small interface. STORAGE_DRIVER in .env picks where NEW uploads go:
+ *   "cloudinary"  images and PDFs in Cloudinary, served from its CDN
+ *   "local"       files in UPLOAD_DIR on this server, served by the API at /uploads/*
+ * `key` is our own path ("posters/2026/11/k3j2h4.jpg"). MediaAsset stores the key and the driver it went to, so
+ * switching drivers later keeps every older file working and deletable.
  */
+export type StorageDriver = 'local' | 'cloudinary'
+
 export interface Storage {
+  driver: StorageDriver
   put(key: string, body: Readable): Promise<{ key: string; url: string; sizeBytes: number }>
   delete(key: string): Promise<void>
   urlFor(key: string): string
 }
 
+export const localPublicBase = (env: Env) => (env.PUBLIC_UPLOAD_URL ?? `http://localhost:${env.PORT}/uploads`).replace(/\/$/, '')
+
+/** The driver new uploads go to (STORAGE_DRIVER). */
 export function createStorage(env: Env): Storage {
-  switch (env.STORAGE_DRIVER) {
-    case 'local':
-      return localStorage(path.resolve(env.UPLOAD_DIR), (env.PUBLIC_UPLOAD_URL ?? `http://localhost:${env.PORT}/uploads`).replace(/\/$/, ''))
-    case 'cloudinary':
-      return cloudinaryStorage(parseCloudinaryUrl(env.CLOUDINARY_URL!), env.CLOUDINARY_FOLDER)
+  return createStorages(env).active
+}
+
+/**
+ * Every driver this server can reach: local always, Cloudinary when CLOUDINARY_URL is set (even while
+ * STORAGE_DRIVER=local, so files uploaded before a switch can still be deleted).
+ */
+export function createStorages(env: Env) {
+  const drivers: Partial<Record<StorageDriver, Storage>> = {
+    local: localStorage(path.resolve(env.UPLOAD_DIR), localPublicBase(env)),
+  }
+  if (env.CLOUDINARY_URL) drivers.cloudinary = cloudinaryStorage(parseCloudinaryUrl(env.CLOUDINARY_URL), env.CLOUDINARY_FOLDER)
+  return {
+    active: drivers[env.STORAGE_DRIVER]!,
+    /** null when the driver is not configured here (e.g. a Cloudinary file while CLOUDINARY_URL is empty) */
+    get: (driver: string) => drivers[driver as StorageDriver] ?? null,
   }
 }
 
@@ -85,6 +103,7 @@ function cloudinaryStorage(cfg: CloudinaryConfig, folder: string, fetchImpl: typ
   }
 
   return {
+    driver: 'cloudinary',
     urlFor,
     async put(key, body) {
       const chunks: Buffer[] = []
@@ -114,6 +133,7 @@ function localStorage(root: string, publicBase: string): Storage {
   }
   const urlFor = (key: string) => `${publicBase}/${key}`
   return {
+    driver: 'local',
     urlFor,
     async put(key, body) {
       const file = resolve(key)

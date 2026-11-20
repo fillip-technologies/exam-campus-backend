@@ -14,6 +14,7 @@ import { pathToFileURL } from 'node:url'
 import { createPrisma } from '../../src/lib/db.js'
 import { slugify } from '../../src/shared/schemas.js'
 import type { Prisma } from '../../src/generated/prisma/client.js'
+import { seedCourses } from './courses.js'
 import { registerFrontendImports } from './frontend-hooks.js'
 import { announcement, footer, homeFaqs, homeSections, orgNames, pass, site } from './home-content.js'
 
@@ -269,8 +270,14 @@ async function main() {
             stage: p.stage ?? null,
             shift: p.shift ?? null,
             type: p.type ?? null,
+            heldOn: p.heldOn ? new Date(`${p.heldOn}T00:00:00Z`) : null,
+            questions: p.questions ?? null,
+            marks: p.marks ?? null,
+            durationMinutes: p.durationMinutes ?? null,
+            languages: p.languages ?? undefined,
             viewUrl: p.viewUrl ?? null,
             downloadUrl: p.downloadUrl ?? null,
+            practiceUrl: p.practiceUrl ?? null,
           })),
         },
         resources: {
@@ -708,6 +715,7 @@ async function wipeContent() {
 
 try {
   await main()
+  console.log('Courses:', await seedCourses(db))
   const counts = {
     exams: await db.exam.count(),
     classes: await db.academicClass.count(),

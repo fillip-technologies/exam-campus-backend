@@ -1,6 +1,6 @@
 import type { Db } from '../../lib/db.js'
 import { activeNow, discountPercent, obj, scheduledNow, strings, validityLabel } from '../../lib/format.js'
-import { LinkResolver, paths } from '../../lib/links.js'
+import { enrollTarget, LinkResolver, paths } from '../../lib/links.js'
 import { getFreeTests } from './freeTests.js'
 import { categoriesWithExams } from './layout.js'
 import { getExplorerMeta, getSeriesCards } from './series.js'
@@ -73,7 +73,8 @@ export async function getHome(db: Db) {
               mrp: pass.mrp,
               discountPercent: discountPercent(pass.price, pass.mrp),
               benefits: strings(pass.benefits),
-              href: paths.enroll(pass.slug),
+              href: enrollTarget(pass),
+              external: Boolean(pass.redirectUrl),
             },
           }
         case 'FREE_TESTS':

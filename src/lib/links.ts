@@ -18,6 +18,27 @@ export const paths = {
   page: (slug: string) => `/pages/${slug}`,
 }
 
+/*
+ * Redirect links ("for now, send visitors to another site"):
+ *   - exams and classes: their own `redirectUrl` replaces the hub page link everywhere (menus, search, cards);
+ *   - courses, test series, the pass and free tests: each item's own `redirectUrl`, else our own page.
+ *     There is no site-wide fallback: every item has its own link.
+ * Empty fields change nothing, so clearing them brings the normal pages back.
+ */
+
+type Redirectable = { slug: string; redirectUrl?: string | null }
+
+/** Exam hub link: its redirect link, else /exams/<slug> once published, else null (no page yet). */
+export const examTarget = (e: Redirectable & { status: string }) => e.redirectUrl || (e.status === 'PUBLISHED' ? paths.exam(e.slug) : null)
+/** Class hub link: same rule as exams. */
+export const classTarget = (c: Redirectable & { status: string }) => c.redirectUrl || (c.status === 'PUBLISHED' ? paths.class(c.slug) : null)
+/** Enroll / Buy button of a series or the pass. */
+export const enrollTarget = (p: Redirectable) => p.redirectUrl || paths.enroll(p.slug)
+/** Start button of a free test. */
+export const freeTestTarget = (t: Redirectable) => t.redirectUrl || paths.freeTest(t.slug)
+/** The redirect a page URL (/enroll/x, /free-test/x) should forward to, or null to show our own page. */
+export const pageRedirect = (p: { redirectUrl?: string | null }) => p.redirectUrl || null
+
 type EntityLinkType = Exclude<LinkType, 'NONE' | 'URL' | 'ANCHOR'>
 const entityTypes: EntityLinkType[] = ['EXAM', 'CLASS', 'SERIES', 'FREE_TEST', 'CATEGORY', 'PAGE']
 
@@ -81,22 +102,30 @@ export class LinkResolver {
     const where = { id: { in: ids } }
     const published = { ...where, status: 'PUBLISHED' as const }
     const select = { id: true, slug: true }
-    const toMap = (rows: { id: string; slug: string | null }[], toPath: (slug: string) => string) =>
-      new Map(rows.filter((r) => r.slug).map((r) => [r.id, toPath(r.slug!)]))
+    const redirectable = { ...select, redirectUrl: true }
+    const toMap = <R extends { id: string; slug: string | null }>(rows: R[], toHref: (row: R & { slug: string }) => string | null) =>
+      new Map(
+        rows
+          .filter((r): r is R & { slug: string } => Boolean(r.slug))
+          .map((r) => [r.id, toHref(r)] as const)
+          .filter((e): e is readonly [string, string] => e[1] !== null),
+      )
 
     switch (type) {
       case 'EXAM':
-        return toMap(await this.db.exam.findMany({ where: published, select }), paths.exam)
+        return toMap(await this.db.exam.findMany({ where: published, select: { ...redirectable, status: true } }), examTarget)
       case 'CLASS':
-        return toMap(await this.db.academicClass.findMany({ where: published, select }), paths.class)
-      case 'SERIES':
-        return toMap(await this.db.testSeries.findMany({ where: published, select }), paths.enroll)
-      case 'FREE_TEST':
-        return toMap(await this.db.freeTest.findMany({ where: published, select }), paths.freeTest)
+        return toMap(await this.db.academicClass.findMany({ where: published, select: { ...redirectable, status: true } }), classTarget)
+      case 'SERIES': {
+        return toMap(await this.db.testSeries.findMany({ where: published, select: redirectable }), enrollTarget)
+      }
+      case 'FREE_TEST': {
+        return toMap(await this.db.freeTest.findMany({ where: published, select: redirectable }), freeTestTarget)
+      }
       case 'CATEGORY':
-        return toMap(await this.db.examCategory.findMany({ where: { ...where, active: true }, select }), paths.category)
+        return toMap(await this.db.examCategory.findMany({ where: { ...where, active: true }, select }), (r) => paths.category(r.slug))
       case 'PAGE':
-        return toMap(await this.db.page.findMany({ where: published, select }), paths.page)
+        return toMap(await this.db.page.findMany({ where: published, select }), (r) => paths.page(r.slug))
     }
   }
 }
